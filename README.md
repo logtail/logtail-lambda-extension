@@ -19,15 +19,15 @@ $ aws lambda publish-layer-version \
       --compatible-architectures x86_64 arm64
 ```
 
-Once deployed set the `LOGTAIL_TOKEN` environment variable on your Lambda to your HTTP API source from Logtail, and [add the layer](https://docs.aws.amazon.com/lambda/latest/dg/invocation-layers.html) to your Lambda function.
+Once deployed set the `SOURCE_TOKEN` environment variable on your Lambda to your Better Stack source token, and [add the layer](https://docs.aws.amazon.com/lambda/latest/dg/invocation-layers.html) to your Lambda function.
 On next invocation your Lambda logs should start appearing in [Better Stack](https://telemetry.betterstack.com/).
 
 ## Environment Variables
 
 | Variable                                 | Description                                             | Default                              |
 | ---------------------------------------- | ------------------------------------------------------- | ------------------------------------ |
-| LOGTAIL_TOKEN                            | Logtail source bearer token                             | **required**                         |
-| LOGTAIL_HTTP_API_URL                     | Logtail HTTP source ingestion API URL                   | `https://in.logtail.com/`            |
+| SOURCE_TOKEN                             | Better Stack source bearer token                        | **required**                         |
+| INGESTING_HOST                           | Better Stack ingesting host                             | `in.logs.betterstack.com`            |
 | EXTENSION_NAME                           | Name of the lambda extension                            | `logtail-lambda-extension`           |
 | RECEIVER_ADDRESS                         | Address of the logs http receiver                       | `sandbox`                            |
 | RECEIVER_PORT                            | Port of the logs http receiver                          | `4243`                               |
@@ -37,6 +37,8 @@ On next invocation your Lambda logs should start appearing in [Better Stack](htt
 | AWS_LAMBDA_RUNTIME_API                   | HTTP base URI to the lambda runtime API                 | _Provided by AWS Lambda environment_ |
 | AWS_LAMBDA_RUNTIME_EXTENSION_API_VERSION | Lambda Extension API version date                       | `2020-01-01`                         |
 | AWS_LAMBDA_RUNTIME_TELEMETRY_API_VERSION | Telemetry API version date                              | `2022-07-01`                         |
+
+`SOURCE_TOKEN` and `INGESTING_HOST` fall back to the legacy `LOGTAIL_TOKEN` and `LOGTAIL_HTTP_API_URL` (a full URL) variables when they are not set.
 
 ### License
 

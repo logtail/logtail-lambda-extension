@@ -9,7 +9,7 @@ describe('test Better Stack log forwarding', () => {
     fetchMock.resetMocks();
   });
 
-  const ingestionUrl = 'https://in.logtail.com/';
+  const ingestionUrl = 'https://in.logs.betterstack.com/';
   const token = 'd4ed7843';
 
   const log: FunctionLogEvent = {

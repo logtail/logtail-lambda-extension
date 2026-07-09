@@ -1,6 +1,10 @@
 name: Test logtail-lambda-extension
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 jobs:
   test:
     runs-on: ubuntu-22.04

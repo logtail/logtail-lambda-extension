@@ -1,15 +1,15 @@
 import fetchMock from 'jest-fetch-mock';
 import { Request } from 'node-fetch';
 import { either as E } from 'fp-ts';
-import { logtailLogForwarder, parseMessageWithPowertoolsLogFormat } from '~/forwarders/logtail';
+import { betterStackLogForwarder, parseMessageWithPowertoolsLogFormat } from '~/forwarders/betterStack';
 import { FunctionLogEvent } from '~/aws/events';
 
-describe('test logtail log forwarding', () => {
+describe('test Better Stack log forwarding', () => {
   beforeEach(() => {
     fetchMock.resetMocks();
   });
 
-  const ingestionUrl = 'https://in.logtail.com/';
+  const ingestionUrl = 'https://in.logs.betterstack.com/';
   const token = 'd4ed7843';
 
   const log: FunctionLogEvent = {
@@ -27,7 +27,7 @@ describe('test logtail log forwarding', () => {
       logsQueue: [log, log, log],
     };
 
-    const result = await logtailLogForwarder(token, ingestionUrl, listener)();
+    const result = await betterStackLogForwarder(token, ingestionUrl, listener)();
 
     expect(E.left(result)).toBeTruthy();
 
@@ -53,7 +53,7 @@ describe('test logtail log forwarding', () => {
       logsQueue: [log, log, log],
     };
 
-    const result = await logtailLogForwarder(token, ingestionUrl, listener)();
+    const result = await betterStackLogForwarder(token, ingestionUrl, listener)();
 
     expect(E.left(result)).toBeTruthy();
 

@@ -35,7 +35,7 @@ export const parseMessageWithPowertoolsLogFormat = (message: string): E.Either<E
     }),
   );
 
-export const logtailLogForwarder =
+export const betterStackLogForwarder =
   (token: string, ingestionUrl: string, listener: { logsQueue: FunctionLogEvent[] }) => (): Promise<void> => {
     const logs = listener.logsQueue.splice(0);
 

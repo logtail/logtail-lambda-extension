@@ -1,7 +1,7 @@
 {
   "name": "logtail-lambda-extension",
   "version": "1.0.0",
-  "description": "",
+  "description": "AWS Lambda extension that forwards function logs to Better Stack.",
   "main": "index.js",
   "engines": {
     "node": ">=16.0.0",

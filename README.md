@@ -19,7 +19,7 @@ $ aws lambda publish-layer-version \
       --compatible-architectures x86_64 arm64
 ```
 
-Once deployed set the `SOURCE_TOKEN` environment variable on your Lambda to your Better Stack source token, and [add the layer](https://docs.aws.amazon.com/lambda/latest/dg/invocation-layers.html) to your Lambda function.
+Once deployed set the `SOURCE_TOKEN` and `INGESTING_HOST` environment variables on your Lambda to the token and ingesting host from your Better Stack source settings (the ingesting host looks like `s123456.lu-trq-1.betterstackdata.com`), and [add the layer](https://docs.aws.amazon.com/lambda/latest/dg/invocation-layers.html) to your Lambda function.
 On next invocation your Lambda logs should start appearing in [Better Stack](https://telemetry.betterstack.com/).
 
 ## Environment Variables

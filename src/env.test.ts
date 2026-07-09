@@ -7,7 +7,7 @@ describe('parseEnvironmentVariables', () => {
     const env = {
       AWS_LAMBDA_RUNTIME_API: 'http://127.0.0.1:9001/',
       SOURCE_TOKEN: 'source_token',
-      INGESTING_HOST: 's123.eu.betterstack.com',
+      INGESTING_HOST: 's123456.lu-trq-1.betterstackdata.com',
     };
 
     const result = parseEnvironmentVariables(env);
@@ -26,7 +26,7 @@ describe('parseEnvironmentVariables', () => {
         TIMEOUT_MS: 1000,
         RECEIVER_PORT: 4243,
         sourceToken: 'source_token',
-        ingestionUrl: 'https://s123.eu.betterstack.com/',
+        ingestionUrl: 'https://s123456.lu-trq-1.betterstackdata.com/',
       },
     });
   });
@@ -68,12 +68,12 @@ describe('parseEnvironmentVariables', () => {
     const result = parseEnvironmentVariables({
       AWS_LAMBDA_RUNTIME_API: 'http://127.0.0.1:9001/',
       SOURCE_TOKEN: 'source_token',
-      INGESTING_HOST: 's123.eu.betterstack.com',
+      INGESTING_HOST: 's123456.lu-trq-1.betterstackdata.com',
       LOGTAIL_HTTP_API_URL: 'https://in.logtail.com/',
     });
 
     if (!E.isRight(result)) throw new Error('expected Right');
-    expect(result.right.ingestionUrl).toBe('https://s123.eu.betterstack.com/');
+    expect(result.right.ingestionUrl).toBe('https://s123456.lu-trq-1.betterstackdata.com/');
   });
 
   test('fails with ZodError when a runtime API is set but no token', () => {

@@ -6,7 +6,7 @@ const envNumber = z
   .transform((val) => Number(val))
   .refine((val) => !isNaN(val));
 
-// Better Stack's general-purpose ingesting host; per-source hosts also live under betterstack.com.
+// Better Stack's general-purpose ingesting host; a source's own host looks like s123456.lu-trq-1.betterstackdata.com.
 const DEFAULT_INGESTING_HOST = 'in.logs.betterstack.com';
 
 const baseSchema = z.object({

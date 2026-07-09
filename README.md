@@ -1,14 +1,14 @@
 # logtail-lambda-extension
-[![Test logtail-lambda-extension](https://github.com/stockstory/logtail-lambda-extension/actions/workflows/test.yml/badge.svg)](https://github.com/stockstory/logtail-lambda-extension/actions/workflows/test.yml)
+[![Test logtail-lambda-extension](https://github.com/logtail/logtail-lambda-extension/actions/workflows/test.yml/badge.svg)](https://github.com/logtail/logtail-lambda-extension/actions/workflows/test.yml)
 
-[AWS Lambda Extension](https://docs.aws.amazon.com/lambda/latest/dg/lambda-extensions.html) that uses the [Lambda Telemetry API](https://docs.aws.amazon.com/lambda/latest/dg/telemetry-api-reference.html) to forward logs to a [Logtail HTTP API source](https://docs.logtail.com/integrations/rest-api).
+[AWS Lambda Extension](https://docs.aws.amazon.com/lambda/latest/dg/lambda-extensions.html) that uses the [Lambda Telemetry API](https://docs.aws.amazon.com/lambda/latest/dg/telemetry-api-reference.html) to forward logs to a [Better Stack HTTP source](https://betterstack.com/docs/logs/http-rest-api/).
 
 # Usage
 
 In order to use the extension you must first build and deploy it into your AWS infrastructure:
 
 ```shell
-$ git clone git@github.com:stockstory/logtail-lambda-extension.git
+$ git clone git@github.com:logtail/logtail-lambda-extension.git
 $ cd logtail-lambda-extension
 $ pnpm install
 $ pnpm run build
@@ -20,7 +20,7 @@ $ aws lambda publish-layer-version \
 ```
 
 Once deployed set the `LOGTAIL_TOKEN` environment variable on your Lambda to your HTTP API source from Logtail, and [add the layer](https://docs.aws.amazon.com/lambda/latest/dg/invocation-layers.html) to your Lambda function.
-On next invocation your Lambda logs should start appearing in your Logtail console.
+On next invocation your Lambda logs should start appearing in [Better Stack](https://telemetry.betterstack.com/).
 
 ## Environment Variables
 

@@ -20,13 +20,13 @@ $ aws lambda publish-layer-version \
 ```
 
 Once deployed set the `SOURCE_TOKEN` and `INGESTING_HOST` environment variables on your Lambda to the token and ingesting host from your Better Stack source settings (the ingesting host looks like `s123456.lu-trq-1.betterstackdata.com`), and [add the layer](https://docs.aws.amazon.com/lambda/latest/dg/invocation-layers.html) to your Lambda function.
-On next invocation your Lambda logs should start appearing in [Better Stack](https://telemetry.betterstack.com/).
+On next invocation your Lambda logs should start appearing in **Telemetry** -> [Live tail](https://telemetry.betterstack.com/team/0/tail).
 
 ## Environment Variables
 
 | Variable                                 | Description                                             | Default                              |
 | ---------------------------------------- | ------------------------------------------------------- | ------------------------------------ |
-| SOURCE_TOKEN                             | Better Stack source bearer token                        | **required**                         |
+| SOURCE_TOKEN                             | Better Stack source token                               | **required**                         |
 | INGESTING_HOST                           | Better Stack ingesting host                             | `in.logs.betterstack.com`            |
 | EXTENSION_NAME                           | Name of the lambda extension                            | `logtail-lambda-extension`           |
 | RECEIVER_ADDRESS                         | Address of the logs http receiver                       | `sandbox`                            |

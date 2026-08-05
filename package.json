@@ -4,7 +4,7 @@
   "description": "AWS Lambda extension that forwards function logs to Better Stack.",
   "main": "index.js",
   "engines": {
-    "node": ">=16.0.0",
+    "node": ">=22.0.0",
     "pnpm": ">=7.0.0"
   },
   "scripts": {

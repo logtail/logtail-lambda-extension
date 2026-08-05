@@ -8,7 +8,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-22.04
-    name: Test
+    name: Test on Node.js ${{ matrix.node-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
     steps:
       - name: Checkout from repository
         uses: actions/checkout@v4
@@ -21,14 +25,14 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
 
       - name: Cache node_modules
         uses: actions/cache@v4
         id: cache-nodemodules
         with:
           path: node_modules
-          key: ${{ runner.os }}-${{ env.NODE_VERSION }}-nodemodules-${{ hashFiles('**/pnpm-lock.yaml') }}
+          key: ${{ runner.os }}-node${{ matrix.node-version }}-nodemodules-${{ hashFiles('**/pnpm-lock.yaml') }}
 
       - name: Install requirements
         if: steps.cache-nodemodules.outputs.cache-hit != 'true'
@@ -36,3 +40,6 @@ jobs:
 
       - name: Validate
         run: pnpm run validate
+
+      - name: Build
+        run: pnpm run build

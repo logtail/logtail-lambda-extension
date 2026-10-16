@@ -1,9 +1,9 @@
 name: E2E
 
 # Follows the AWS Lambda docs article exactly as written, for both of its languages, in a throwaway AWS account:
-# - Node.js: builds this repository with the article's `pnpm install` + `pnpm run build`, publishes the layer with the
-#   article's `aws lambda publish-layer-version` command, and runs one function per runtime and architecture that
-#   command lists, with the article's environment variables and its logging snippet as the handler.
+# - Node.js: gets the layer ZIP the way the article's first code block does, publishes it with the article's
+#   `aws lambda publish-layer-version` command, and runs one function per runtime and architecture that command lists,
+#   with the article's environment variables and its logging snippet as the handler.
 # - Python: installs the article's pip packages into the deployment package and runs a function whose module is the
 #   article's setup snippet and whose handler is the article's logging snippet.
 # Each function gets its own source, is invoked once, and every line the snippet logs must be stored once, with the
@@ -12,12 +12,16 @@ name: E2E
 # WAIT_SECONDS to tell how late lines arrive. The source token and ingesting host are filled in where the article shows
 # its $SOURCE_TOKEN and $INGESTING_HOST placeholders, as the article does for a signed-in reader. The docs job fails
 # when the article's code blocks no longer have the shape this test reads.
-# The layer job runs the article's build with the latest pnpm, as a reader would. When that fails, the job fails and
-# pnpm 8 (the lockfile's version, as in test.yml) builds the layer instead, so the Lambda jobs still run.
-# Pull requests and pushes to main build the layer from the checkout; the daily schedule builds main, which is what the
-# article's `git clone` gets. Everything a job creates is named after NAME and deleted in its cleanup step, together
-# with leftovers of earlier runs of the same runtime and architecture older than two hours. Pull requests from forks
-# are skipped: they get no OIDC token.
+# The layer job understands two shapes of that first block:
+# - Building this repository (`git clone` + `pnpm install` + `pnpm run build`): it runs the build with the latest pnpm,
+#   as a reader would. When that fails, the job fails and pnpm 8 (the lockfile's version) builds the layer instead, so
+#   the Lambda jobs still run. The checkout stands in for the clone; on the schedule that is main.
+# - Downloading the latest release (`curl -fsSLO …/releases/latest/download/<file>.zip`): the daily schedule downloads
+#   the ZIP the article links, pull requests and pushes to main build the checkout the way releases.yml does, which is
+#   what they would release.
+# Everything a job creates is named after NAME and deleted in its cleanup step, together with leftovers of earlier runs
+# of the same runtime and architecture older than two hours. Pull requests from forks are skipped: they get no OIDC
+# token.
 # See the docs article in https://betterstack.com/docs/logs/aws-lambda/
 #
 # AWS account: better-stack-e2e-lambda (352333568934), shared with logtail/logtail-aws-lambda's E2E. Root sign-in:
@@ -65,7 +69,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.read.outputs.matrix }}
+      install: ${{ steps.read.outputs.install }}
       layer_zip: ${{ steps.read.outputs.layer_zip }}
+      zip_url: ${{ steps.read.outputs.zip_url }}
 
     steps:
       - name: "[Setup] Fetch the article"
@@ -81,20 +87,27 @@ jobs:
           page = open('docs.html', encoding='utf-8').read()
           blocks = [(language, html.unescape(re.sub(r'<[^>]+>', '', code)).strip())
                     for language, code in re.findall(r"<pre class='highlight language-(\w+)'><code>(.*?)</code></pre>", page, re.S)]
-          ROLES = ['Node.js build', 'Node.js environment variables', 'Node.js logging', 'Python install', 'Python setup', 'Python logging']
+          ROLES = ['Node.js install', 'Node.js environment variables', 'Node.js logging', 'Python install', 'Python setup', 'Python logging']
           LANGUAGES = ['bash', 'text', 'js', 'bash', 'python', 'python']
           if [language for language, _ in blocks] != LANGUAGES:
               sys.exit(f"::error::{os.environ['DOCS_URL']} changed: its code blocks are now {[language for language, _ in blocks]}, "
                        f"this test reads {LANGUAGES} as {ROLES}")
-          node_build, node_env, node_logging, python_install, python_setup, python_logging = [code for _, code in blocks]
+          node_install, node_env, node_logging, python_install, python_setup, python_logging = [code for _, code in blocks]
           PLACEHOLDERS = {'$SOURCE_TOKEN', '$INGESTING_HOST'}
           problems = []
 
-          # Node.js build: clone this repository, build it, publish the ZIP as a layer.
-          commands = [line.strip() for line in node_build.replace('\\\n', ' ').splitlines() if line.strip()]
-          steps = [f'git clone git@github.com:{repository}.git', f'cd {repository.split("/")[1]}', 'pnpm install', 'pnpm run build']
-          if commands[:-1] != steps:
-              problems.append(f'Node.js build commands are {commands[:-1]}, this test runs {steps}')
+          # Node.js install: build this repository or download its latest release, then publish the ZIP as a layer.
+          commands = [line.strip() for line in node_install.replace('\\\n', ' ').splitlines() if line.strip()]
+          BUILD = [f'git clone git@github.com:{repository}.git', f'cd {repository.split("/")[1]}', 'pnpm install', 'pnpm run build']
+          download = re.fullmatch(rf'curl -fsSLO (https://github\.com/{re.escape(repository)}/releases/latest/download/([\w.-]+\.zip))', commands[0]) if len(commands) == 2 else None
+          install, zip_url, zip_name = None, '', ''
+          if commands[:-1] == BUILD:
+              install = 'build'
+          elif download:
+              install, zip_url, zip_name = 'download', download[1], download[2]
+          else:
+              problems.append(f'Node.js install commands are {commands[:-1]}, this test runs either {BUILD} or '
+                              f'["curl -fsSLO https://github.com/{repository}/releases/latest/download/<file>.zip"]')
           publish = shlex.split(commands[-1]) if commands else []
           options, option = {}, None
           for word in publish[3:]:
@@ -114,6 +127,8 @@ jobs:
               problems.append(f'the layer publish command is {commands[-1:]}, this test reads --layer-name, --zip-file fileb://…, '
                               f'--compatible-runtimes nodejs<N>.x … and --compatible-architectures x86_64/arm64')
               options = {'--zip-file': ['fileb://'], '--compatible-runtimes': [], '--compatible-architectures': []}
+          if install == 'download' and options['--zip-file'][0].removeprefix('fileb://').removeprefix('./') != zip_name:
+              problems.append(f"the layer publish command uploads {options['--zip-file'][0]}, the article downloads {zip_name}")
 
           # Node.js environment variables: "NAME: value" lines, values may carry the article's placeholders.
           environment = {}
@@ -203,10 +218,13 @@ jobs:
                        'python': runtime.removeprefix('python')} for runtime in os.environ['PYTHON_RUNTIMES'].split()]
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f"matrix={json.dumps({'include': include})}\n")
+              output.write(f"install={install}\n")
               output.write(f"layer_zip={options['--zip-file'][0].removeprefix('fileb://')}\n")
+              output.write(f"zip_url={zip_url}\n")
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write(f"### Docs article\n\n{os.environ['DOCS_URL']} matches what this test runs:\n\n"
-                            f"- layer for {', '.join(options['--compatible-runtimes'])} on {', '.join(options['--compatible-architectures'])}\n"
+                            f"- layer {'built from this repository' if install == 'build' else f'downloaded from {zip_url}'}, "
+                            f"for {', '.join(options['--compatible-runtimes'])} on {', '.join(options['--compatible-architectures'])}\n"
                             f"- Node.js environment variables {', '.join(f'`{name}: {value}`' for name, value in environment.items())}\n"
                             f"- Python packages {', '.join(f'`{package}`' for package in packages)}, tested on {os.environ['PYTHON_RUNTIMES']}\n"
                             f"- {len(node_lines)} Node.js and {len(python_lines)} Python log lines\n")
@@ -220,15 +238,19 @@ jobs:
           if-no-files-found: error
 
   layer:
-    name: Layer build as documented
+    name: Layer ZIP as documented
     needs: docs
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      INSTALL: ${{ needs.docs.outputs.install }}
+      LAYER_ZIP: ${{ needs.docs.outputs.layer_zip }}
+      ZIP_URL: ${{ needs.docs.outputs.zip_url }}
     outputs:
-      built_with: ${{ steps.report.outputs.built_with }}
+      layer_from: ${{ steps.collect.outputs.layer_from }}
 
     steps:
-      - name: "[Setup] Checkout code (the article's git clone)"
+      - name: "[Setup] Checkout code"
         uses: actions/checkout@v7
 
       - name: "[Setup] Node.js 22, the article's minimum"
@@ -237,8 +259,9 @@ jobs:
           node-version: 22.x
 
       # Outside pnpm's CI mode, as in a reader's terminal.
-      - name: "[Test] pnpm install and pnpm run build with the latest pnpm"
+      - name: "[Test] The article's pnpm install and pnpm run build with the latest pnpm"
         id: latest
+        if: ${{ env.INSTALL == 'build' }}
         continue-on-error: true
         run: |
           npm install --global pnpm@latest
@@ -255,34 +278,63 @@ jobs:
           env -u CI pnpm install
           env -u CI pnpm run build
 
-      - name: "[Setup] Share the layer ZIP with the Lambda jobs"
+      - name: "[Test] The article's curl -fsSLO of the latest release"
+        if: ${{ env.INSTALL == 'download' && github.event_name == 'schedule' }}
+        run: |
+          curl -fsSLO "$ZIP_URL"
+          RELEASE_TAG=$(curl -sSI "$ZIP_URL" | tr -d '\r' | sed -nE 's#^[Ll]ocation: .*/releases/download/([^/]+)/.*#\1#p' | head -1)
+          echo "LAYER_FROM=release ${RELEASE_TAG:-unknown} from $ZIP_URL" >> "$GITHUB_ENV"
+
+      - name: "[Setup] Build the checkout the way releases.yml does"
+        if: ${{ env.INSTALL == 'download' && github.event_name != 'schedule' }}
+        run: |
+          npm install --global pnpm@8
+          pnpm install
+          pnpm run build
+          [ -f "dist/$LAYER_ZIP" ] || { echo "::error::the article publishes $LAYER_ZIP, the build made $(ls dist | tr '\n' ' ')"; exit 1; }
+          cp "dist/$LAYER_ZIP" "$LAYER_ZIP"
+          echo "LAYER_FROM=$(git rev-parse --short HEAD) built with pnpm $(pnpm --version) as releases.yml does" >> "$GITHUB_ENV"
+
+      - name: "[Setup] Share the ZIP the article publishes with the Lambda jobs"
+        id: collect
+        run: |
+          if [ "$INSTALL" = build ]; then LAYER_FROM="$(git rev-parse --short HEAD) built with pnpm $(pnpm --version)"; fi
+          [ -f "$LAYER_ZIP" ] || { echo "::error::the article publishes $LAYER_ZIP, which its install steps did not make; dist/ holds $(ls dist 2>/dev/null | tr '\n' ' ')"; exit 1; }
+          mkdir layer
+          cp "$LAYER_ZIP" layer/layer.zip
+          echo "layer_from=$LAYER_FROM" >> "$GITHUB_OUTPUT"
+          echo "$LAYER_FROM, $(stat -c %s layer/layer.zip) bytes:"
+          unzip -Z layer/layer.zip
+
+      - name: "[Setup] Upload the ZIP"
         uses: actions/upload-artifact@v7
         with:
           name: layer
-          path: ${{ needs.docs.outputs.layer_zip }}
+          path: layer/layer.zip
           if-no-files-found: error
 
-      - name: "[Check] The article's build works with the latest pnpm"
-        id: report
+      - name: "[Report] Layer ZIP"
         if: ${{ always() }}
         run: |
-          BUILT_WITH="pnpm $(pnpm --version)"
-          echo "built_with=$BUILT_WITH" >> "$GITHUB_OUTPUT"
           {
-            echo "### Layer build"
+            echo "### Layer ZIP"
             echo
-            if [ "${{ steps.latest.outcome }}" = success ]; then
-              echo "✅ \`pnpm install\` + \`pnpm run build\` with the latest pnpm ($LATEST_PNPM) on Node.js $(node --version)"
-            else
-              echo "❌ \`pnpm install\` + \`pnpm run build\` failed with the latest pnpm (${LATEST_PNPM:-unknown}) on Node.js $(node --version), see the step log; the Lambda jobs use the layer built with $BUILT_WITH"
+            if [ "$INSTALL" = build ] && [ "${{ steps.latest.outcome }}" = success ]; then
+              echo "- ✅ the article's \`pnpm install\` + \`pnpm run build\` with the latest pnpm ($LATEST_PNPM) on Node.js $(node --version)"
+            elif [ "$INSTALL" = build ]; then
+              echo "- ❌ the article's \`pnpm install\` + \`pnpm run build\` failed with the latest pnpm (${LATEST_PNPM:-unknown}) on Node.js $(node --version), see the step log"
             fi
+            echo "- the Lambda jobs publish ${{ steps.collect.outputs.layer_from || 'nothing: no ZIP was made' }}"
           } >> "$GITHUB_STEP_SUMMARY"
-          [ "${{ steps.latest.outcome }}" = success ] || { echo "::error::the article's pnpm install + pnpm run build failed with the latest pnpm (${LATEST_PNPM:-unknown})"; exit 1; }
+          if [ "$INSTALL" = build ] && [ "${{ steps.latest.outcome }}" != success ]; then
+            echo "::error::the article's pnpm install + pnpm run build failed with the latest pnpm (${LATEST_PNPM:-unknown})"
+            exit 1
+          fi
 
   lambda:
     name: ${{ matrix.runtime }} ${{ matrix.arch }}
     needs: [docs, layer]
-    # Runs when only the latest-pnpm build failed: the layer job then shares the pnpm 8 build.
+    # Runs when only the latest-pnpm build failed: the layer job then shares the pnpm 8 build. Python needs no layer.
     if: ${{ !cancelled() && needs.docs.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -357,7 +409,7 @@ jobs:
       - name: "[Test] Publish the layer with the article's command"
         if: ${{ matrix.language == 'node' }}
         run: |
-          LAYER_ARN=$(aws lambda publish-layer-version --layer-name "$NAME" --zip-file "fileb://layer/$(basename '${{ needs.docs.outputs.layer_zip }}')" \
+          LAYER_ARN=$(aws lambda publish-layer-version --layer-name "$NAME" --zip-file fileb://layer/layer.zip \
             --compatible-runtimes $(jq -r '.layer.runtimes | join(" ")' article/article.json) \
             --compatible-architectures $(jq -r '.layer.architectures | join(" ")' article/article.json) \
             --query LayerVersionArn --output text)
@@ -369,7 +421,7 @@ jobs:
           mkdir package
           if [ "$LANGUAGE" = node ]; then
             cp article/index.mjs package/index.mjs
-            echo "PACKAGE_VERSIONS=layer built with ${{ needs.layer.outputs.built_with }}" >> "$GITHUB_ENV"
+            echo "PACKAGE_VERSIONS=layer ${{ needs.layer.outputs.layer_from }}" >> "$GITHUB_ENV"
           else
             pip3 install --quiet --target package $(jq -r '.packages | join(" ")' article/article.json)
             # The placeholders in the article's setup snippet are filled in as the article does for a signed-in reader.

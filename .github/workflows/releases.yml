@@ -1,0 +1,56 @@
+name: Releases
+
+on:
+  push:
+    branches: main
+    # Only what makes up the layer ZIP cuts a release (tests and docs do not count)
+    paths:
+      - src/**
+      - "!src/**/*.test.ts"
+      - extension.sh
+      - scripts/build.ts
+      - package.json
+      - pnpm-lock.yaml
+      - tsconfig.json
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build ZIP archive (runs the tests first)
+        run: pnpm run build
+
+      - name: Tag new version
+        id: tagger
+        uses: phish108/autotag-action@v1.1.64
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN}}
+          bump: minor
+          with-v: true
+          release-branch: main
+
+      - name: Create release on Github
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "v${{ steps.tagger.outputs.new-tag }}"
+          artifacts: dist/logtail-lambda-extension.zip
+          generateReleaseNotes: true

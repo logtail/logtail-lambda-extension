@@ -6,12 +6,15 @@ name: E2E
 #   with the article's environment variables and its logging snippet as the handler.
 # - Python: installs the article's pip packages into the deployment package and runs a function whose module is the
 #   article's setup snippet and whose handler is the article's logging snippet.
-# Each function gets its own source and is invoked twice. A first read-back waits FIRST_WAIT_SECONDS for the first
-# invocation's lines; then the second invocation thaws the execution environment Lambda froze after the first one, and
-# a second read-back waits up to WAIT_SECONDS for both invocations' lines, to tell how late they arrive. Every line the
-# snippet logs must be stored once per invocation, with the level and fields it was logged with, a dt inside that
-# invocation (which is how rows are told apart, every invocation logs the same lines), in the order it was logged, and
-# received by Better Stack (ingest_time) within DELIVERY_LIMIT_SECONDS of that invocation returning. The source token
+# Each function gets its own source. It is invoked once (a cold start, with the execution environment's
+# initialization) and a first read-back waits FIRST_WAIT_SECONDS for that invocation's lines; then LATER_INVOCATIONS
+# warm invocations follow INVOKE_INTERVAL_SECONDS apart, and a final read-back waits up to WAIT_SECONDS for every
+# invocation's lines. Lambda freezes the environment between invocations, so the report says for every line during
+# which invocation (or after the last one) Better Stack received it, which tells a cold-start delay from one that
+# repeats on warm invocations. Every line the snippet logs must be stored once per invocation, with the level and fields
+# it was logged with, a dt inside that invocation (which is how rows are told apart, every invocation logs the same
+# lines), in the order it was logged, and received by Better Stack (ingest_time) within DELIVERY_LIMIT_SECONDS of that
+# invocation returning. The source token
 # and ingesting host are filled in where the article shows its $SOURCE_TOKEN and $INGESTING_HOST placeholders, as the
 # article does for a signed-in reader. The docs job fails when the article's code blocks no longer have the shape this
 # test reads.
@@ -61,6 +64,10 @@ env:
   DELIVERY_LIMIT_SECONDS: 60
   # Rows become queryable some 10 to 20 s after Better Stack receives them.
   FIRST_WAIT_SECONDS: 90
+  # After the first invocation (a cold start) and its read-back, the warm invocations; DELIVERY_LIMIT_SECONDS apart, so
+  # lines that wait for a later invocation miss the limit.
+  LATER_INVOCATIONS: 4
+  INVOKE_INTERVAL_SECONDS: 60
   WAIT_SECONDS: 900
   TEST_TEAM_TELEMETRY_API: ${{ secrets.TEST_TEAM_TELEMETRY_API }}
   TEST_TEAM_CONNECTION_USERNAME: ${{ secrets.TEST_TEAM_CONNECTION_USERNAME }}
@@ -455,17 +462,26 @@ jobs:
           aws lambda wait function-active-v2 --function-name "$NAME"
           echo "created $NAME on $RUNTIME $ARCH"
 
-      - name: "[Test] Invoke the function"
+      - name: "[Test] Invoke the function (a cold start)"
+        env:
+          COUNT: 1
         run: &invoke |
-          INVOKED_AT_MS=$(date +%s%3N)
-          aws lambda invoke --function-name "$NAME" --log-type Tail --cli-read-timeout 120 response.json > invoke.json
-          RETURNED_AT_MS=$(date +%s%3N)
-          jq -nc --argjson invoked "$INVOKED_AT_MS" --argjson returned "$RETURNED_AT_MS" '{invoked_at: $invoked, returned_at: $returned}' >> invocations.jsonl
-          echo "invocation $(wc -l < invocations.jsonl) took $((RETURNED_AT_MS - INVOKED_AT_MS)) ms, response $(cat response.json), its log tail:"
-          jq -r '.LogResult' invoke.json | base64 -d
-          jq -e '.StatusCode == 200 and .FunctionError == null' invoke.json >/dev/null || { echo "::error::the invocation failed: $(jq -c 'del(.LogResult)' invoke.json)"; exit 1; }
+          for i in $(seq "$COUNT"); do
+            [ "$i" = 1 ] || sleep "$INVOKE_INTERVAL_SECONDS"
+            INVOKED_AT_MS=$(date +%s%3N)
+            aws lambda invoke --function-name "$NAME" --log-type Tail --cli-read-timeout 120 response.json > invoke.json
+            RETURNED_AT_MS=$(date +%s%3N)
+            TAIL=$(jq -r '.LogResult' invoke.json | base64 -d)
+            # Lambda reports an init duration for the invocation that started the execution environment only.
+            INIT_MS=$(sed -nE 's/.*Init Duration: ([0-9.]+) ms.*/\1/p' <<<"$TAIL" | head -1)
+            jq -nc --argjson invoked "$INVOKED_AT_MS" --argjson returned "$RETURNED_AT_MS" --arg init "$INIT_MS" \
+              '{invoked_at: $invoked, returned_at: $returned, init_ms: ($init | if . == "" then null else tonumber end)}' >> invocations.jsonl
+            echo "invocation $(wc -l < invocations.jsonl) took $((RETURNED_AT_MS - INVOKED_AT_MS)) ms, response $(cat response.json), its log tail:"
+            echo "$TAIL"
+            jq -e '.StatusCode == 200 and .FunctionError == null' invoke.json >/dev/null || { echo "::error::the invocation failed: $(jq -c 'del(.LogResult)' invoke.json)"; exit 1; }
+          done
 
-      # Its verdict is the second read-back's too, which also measures how late these lines arrive.
+      # Its verdict is the final read-back's too, which also tells when these lines arrived.
       - name: "[Test] Read the first invocation's lines back through the SQL API connection"
         continue-on-error: true
         shell: python
@@ -522,6 +538,15 @@ jobs:
                       return k
               return None
 
+          # When Better Stack received a line, relative to the invocations: during one (1 s for the runner's clock against
+          # AWS's), or after the one before it.
+          def received_during(ms):
+              for k, invocation in enumerate(invocations, 1):
+                  if invocation['invoked_at'] - 1000 <= ms <= invocation['returned_at'] + 1000:
+                      return f'during {k}'
+              earlier = [k for k, invocation in enumerate(invocations, 1) if invocation['returned_at'] < ms]
+              return f'after {earlier[-1]}' if earlier else 'before 1'
+
           problems = []
           if len(rows) != expected_rows:
               problems.append(f"{len(rows)} rows stored within {env['READBACK_SECONDS']} s of invocation {len(invocations)}, "
@@ -539,7 +564,7 @@ jobs:
                   if len(hits) != 1:
                       if hits or rows:
                           problems.append(f"{label} ({line['message']!r}) is in {len(hits)} rows, expected 1")
-                      table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ❌ {len(hits)} rows | | |")
+                      table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ❌ {len(hits)} rows | | | |")
                       continue
                   row = rows[hits[0]]
                   matched.append(hits[0])
@@ -560,7 +585,8 @@ jobs:
                   delay = (row['ingest_ms'] - invocation['returned_at']) / 1000
                   if delay > limit:
                       problems.append(f"{label}: Better Stack received it {delay:.1f} s after invocation {k} returned, more than {limit} s")
-                  table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ✅ | {(row['dt_ms'] - invocation['invoked_at']) / 1000:+.3f} s | {delay:.1f} s |")
+                  table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ✅ | {(row['dt_ms'] - invocation['invoked_at']) / 1000:+.3f} s "
+                               f"| {delay:.1f} s | {received_during(row['ingest_ms'])} |")
               if matched != sorted(matched):
                   problems.append(f"invocation {k}: ordered by dt, the rows are not in the order the snippet logs them")
 
@@ -569,7 +595,7 @@ jobs:
               json.dump(rows, file, indent=2, ensure_ascii=False)
           with open(f"out/readback-{env['READBACK']}.md", 'w') as file:
               file.write(f"#### Read-back after invocation {len(invocations)}, waiting up to {env['READBACK_SECONDS']} s\n\n"
-                         f"| invocation | # | logged | stored | dt from invocation start | received after invocation returned |\n|---|---|---|---|---|---|\n"
+                         f"| invocation | # | logged | stored | dt from invocation start | received after invocation returned | received during/after invocation |\n|---|---|---|---|---|---|---|\n"
                          + '\n'.join(table) + '\n\n'
                          + ('\n'.join(f'- ❌ {problem}' for problem in problems) if problems else '✅ every line stored once per invocation, as logged, on time') + '\n')
           print(open(f"out/readback-{env['READBACK']}.md").read())
@@ -577,13 +603,15 @@ jobs:
               print('\n'.join(f'::error::{problem}' for problem in problems))
               sys.exit(1)
 
-      - name: "[Test] Invoke the function a second time"
+      - name: "[Test] Invoke the function ${{ env.LATER_INVOCATIONS }} more times, ${{ env.INVOKE_INTERVAL_SECONDS }} s apart"
+        env:
+          COUNT: ${{ env.LATER_INVOCATIONS }}
         run: *invoke
 
-      - name: "[Test] Read both invocations' lines back through the SQL API connection"
+      - name: "[Test] Read every invocation's lines back through the SQL API connection"
         shell: python
         env:
-          READBACK: second
+          READBACK: final
           READBACK_SECONDS: ${{ env.WAIT_SECONDS }}
         run: *readback
 
@@ -648,9 +676,9 @@ jobs:
             echo "### $RUNTIME $ARCH \`$NAME\`"
             echo
             [ -z "${SOURCE_ID:-}" ] || echo "- source $SOURCE_ID, ${PACKAGE_VERSIONS:-}"
-            [ ! -f invocations.jsonl ] || jq -rs 'to_entries[] | "- invocation \(.key + 1) took \((.value.returned_at - .value.invoked_at) / 1000) s"' invocations.jsonl
+            [ ! -f invocations.jsonl ] || jq -rs 'to_entries[] | "- invocation \(.key + 1) at \(.value.invoked_at / 1000 | strftime("%H:%M:%S")), took \((.value.returned_at - .value.invoked_at) / 1000) s\(if .value.init_ms then ", a cold start with \(.value.init_ms) ms of init" else "" end)"' invocations.jsonl
             echo
-            for readback in out/readback-first.md out/readback-second.md; do [ ! -f "$readback" ] || { cat "$readback"; echo; }; done
+            for readback in out/readback-first.md out/readback-final.md; do [ ! -f "$readback" ] || { cat "$readback"; echo; }; done
             [ -f out/readback-first.md ] || echo "No read-back, the job failed before it."
           } >> "$GITHUB_STEP_SUMMARY"
           [ -s out/rows.json ] && [ "$(jq length out/rows.json)" -gt 0 ] && { echo; echo '<details><summary>stored rows</summary>'; echo; echo '```json'; cat out/rows.json; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"

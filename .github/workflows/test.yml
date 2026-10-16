@@ -43,3 +43,10 @@ jobs:
 
       - name: Build
         run: pnpm run build
+
+      # Lambda starts every file in /opt/extensions as an executable
+      - name: Check the extension is executable in the layer ZIP
+        run: |
+          entry=$(unzip -Z dist/logtail-lambda-extension.zip extensions/logtail-lambda-extension)
+          echo "$entry"
+          [[ $entry == -rwx* ]] || { echo "::error::extensions/logtail-lambda-extension is not executable in the layer ZIP"; exit 1; }

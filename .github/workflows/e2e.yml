@@ -13,7 +13,7 @@ name: E2E
 # its $SOURCE_TOKEN and $INGESTING_HOST placeholders, as the article does for a signed-in reader. The docs job fails
 # when the article's code blocks no longer have the shape this test reads.
 # The layer job runs the article's build with the latest pnpm, as a reader would. When that fails, the job fails and
-# pnpm 9 (the lockfile's version) builds the layer instead, so the Lambda jobs still run.
+# pnpm 8 (the lockfile's version, as in test.yml) builds the layer instead, so the Lambda jobs still run.
 # Pull requests and pushes to main build the layer from the checkout; the daily schedule builds main, which is what the
 # article's `git clone` gets. Everything a job creates is named after NAME and deleted in its cleanup step, together
 # with leftovers of earlier runs of the same runtime and architecture older than two hours. Pull requests from forks
@@ -245,12 +245,12 @@ jobs:
           env -u CI pnpm install
           env -u CI pnpm run build
 
-      - name: "[Setup] Build with pnpm 9 instead, so the Lambda jobs still run"
+      - name: "[Setup] Build with pnpm 8, the lockfile's version, so the Lambda jobs still run"
         if: ${{ steps.latest.outcome == 'failure' }}
         run: |
           git checkout -- .
           git clean -fdxq
-          npm install --global pnpm@9
+          npm install --global pnpm@8
           env -u CI pnpm install
           env -u CI pnpm run build
 
@@ -281,7 +281,7 @@ jobs:
   lambda:
     name: ${{ matrix.runtime }} ${{ matrix.arch }}
     needs: [docs, layer]
-    # Runs when only the latest-pnpm build failed: the layer job then shares the pnpm 9 build.
+    # Runs when only the latest-pnpm build failed: the layer job then shares the pnpm 8 build.
     if: ${{ !cancelled() && needs.docs.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45

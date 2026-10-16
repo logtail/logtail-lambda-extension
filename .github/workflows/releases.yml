@@ -1,0 +1,57 @@
+name: Releases
+
+on:
+  push:
+    branches: main
+    # Only what makes up the layer ZIP cuts a release (tests and docs do not count)
+    paths:
+      - src/**
+      - "!src/**/*.test.ts"
+      - extension.sh
+      - scripts/build.ts
+      - package.json
+      - pnpm-lock.yaml
+      - tsconfig.json
+
+concurrency:
+  group: releases
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build ZIP archive (runs the tests first)
+        run: pnpm run build
+
+      # Bumps the minor version of the latest release. The first release is v1.1.0, after the unreleased 1.0.0.
+      - name: Pick the next version
+        id: version
+        run: |
+          latest=$(gh release view --json tagName --jq .tagName || echo v1.0.0)
+          IFS=. read -r major minor _ <<< "${latest#v}"
+          echo "tag=v$major.$((minor + 1)).0" >> "$GITHUB_OUTPUT"
+
+      - name: Create release on GitHub
+        run: gh release create "${{ steps.version.outputs.tag }}" dist/logtail-lambda-extension.zip --target "$GITHUB_SHA" --generate-notes

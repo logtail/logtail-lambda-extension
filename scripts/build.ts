@@ -13,7 +13,7 @@ const buildDir = path.join(root, `./dist/build`);
 const entry = path.join(root, './src/index.js');
 const outputIndex = path.join(root, `./dist/build/${extensionName}/index.js`);
 const outputExtensionScript = path.join(root, `./dist/build/extensions/${extensionName}`);
-const extensionZip = path.join(root, `./dist/extension.zip`);
+const extensionZip = path.join(root, `./dist/${extensionName}.zip`);
 const extensionScript = path.join(root, `extension.sh`);
 
 const zip = (dir: string, outputFile: string) => () =>

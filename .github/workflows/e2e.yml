@@ -6,12 +6,15 @@ name: E2E
 #   with the article's environment variables and its logging snippet as the handler.
 # - Python: installs the article's pip packages into the deployment package and runs a function whose module is the
 #   article's setup snippet and whose handler is the article's logging snippet.
-# Each function gets its own source, is invoked once, and every line the snippet logs must be stored once, with the
-# level and fields it was logged with, a dt inside the invocation, in the order it was logged, and received by Better
-# Stack (ingest_time) within DELIVERY_LIMIT_SECONDS of the invocation returning. The read-back waits up to
-# WAIT_SECONDS to tell how late lines arrive. The source token and ingesting host are filled in where the article shows
-# its $SOURCE_TOKEN and $INGESTING_HOST placeholders, as the article does for a signed-in reader. The docs job fails
-# when the article's code blocks no longer have the shape this test reads.
+# Each function gets its own source and is invoked twice. A first read-back waits FIRST_WAIT_SECONDS for the first
+# invocation's lines; then the second invocation thaws the execution environment Lambda froze after the first one, and
+# a second read-back waits up to WAIT_SECONDS for both invocations' lines, to tell how late they arrive. Every line the
+# snippet logs must be stored once per invocation, with the level and fields it was logged with, a dt inside that
+# invocation (which is how rows are told apart, every invocation logs the same lines), in the order it was logged, and
+# received by Better Stack (ingest_time) within DELIVERY_LIMIT_SECONDS of that invocation returning. The source token
+# and ingesting host are filled in where the article shows its $SOURCE_TOKEN and $INGESTING_HOST placeholders, as the
+# article does for a signed-in reader. The docs job fails when the article's code blocks no longer have the shape this
+# test reads.
 # The layer job understands two shapes of that first block:
 # - Building this repository (`git clone` + `pnpm install` + `pnpm run build`): it runs the build with the latest pnpm,
 #   as a reader would. When that fails, the job fails and pnpm 8 (the lockfile's version) builds the layer instead, so
@@ -56,6 +59,8 @@ env:
   # The article asks for Python 3.7 or higher; these are the oldest and the newest Python runtimes Lambda supports.
   PYTHON_RUNTIMES: python3.11 python3.14
   DELIVERY_LIMIT_SECONDS: 60
+  # Rows become queryable some 10 to 20 s after Better Stack receives them.
+  FIRST_WAIT_SECONDS: 90
   WAIT_SECONDS: 900
   TEST_TEAM_TELEMETRY_API: ${{ secrets.TEST_TEAM_TELEMETRY_API }}
   TEST_TEAM_CONNECTION_USERNAME: ${{ secrets.TEST_TEAM_CONNECTION_USERNAME }}
@@ -450,26 +455,31 @@ jobs:
           aws lambda wait function-active-v2 --function-name "$NAME"
           echo "created $NAME on $RUNTIME $ARCH"
 
-      - name: "[Test] Invoke the function once"
-        run: |
+      - name: "[Test] Invoke the function"
+        run: &invoke |
           INVOKED_AT_MS=$(date +%s%3N)
           aws lambda invoke --function-name "$NAME" --log-type Tail --cli-read-timeout 120 response.json > invoke.json
           RETURNED_AT_MS=$(date +%s%3N)
-          echo "INVOKED_AT_MS=$INVOKED_AT_MS" >> "$GITHUB_ENV"
-          echo "RETURNED_AT_MS=$RETURNED_AT_MS" >> "$GITHUB_ENV"
-          echo "invocation took $((RETURNED_AT_MS - INVOKED_AT_MS)) ms, response $(cat response.json), its log tail:"
+          jq -nc --argjson invoked "$INVOKED_AT_MS" --argjson returned "$RETURNED_AT_MS" '{invoked_at: $invoked, returned_at: $returned}' >> invocations.jsonl
+          echo "invocation $(wc -l < invocations.jsonl) took $((RETURNED_AT_MS - INVOKED_AT_MS)) ms, response $(cat response.json), its log tail:"
           jq -r '.LogResult' invoke.json | base64 -d
           jq -e '.StatusCode == 200 and .FunctionError == null' invoke.json >/dev/null || { echo "::error::the invocation failed: $(jq -c 'del(.LogResult)' invoke.json)"; exit 1; }
 
-      - name: "[Test] Read the lines back through the SQL API connection"
+      # Its verdict is the second read-back's too, which also measures how late these lines arrive.
+      - name: "[Test] Read the first invocation's lines back through the SQL API connection"
+        continue-on-error: true
         shell: python
-        run: |
+        env:
+          READBACK: first
+          READBACK_SECONDS: ${{ env.FIRST_WAIT_SECONDS }}
+        run: &readback |
           import base64, json, os, sys, time, urllib.error, urllib.request
 
           env = os.environ
           language = env['LANGUAGE']
-          expected = json.load(open('article/article.json'))['lines'][language]
-          invoked_at, returned_at = int(env['INVOKED_AT_MS']), int(env['RETURNED_AT_MS'])
+          lines = json.load(open('article/article.json'))['lines'][language]
+          invocations = [json.loads(line) for line in open('invocations.jsonl') if line.strip()]
+          expected_rows = len(lines) * len(invocations)
           limit = int(env['DELIVERY_LIMIT_SECONDS'])
           credentials = base64.b64encode(f"{env['TEST_TEAM_CONNECTION_USERNAME']}:{env['TEST_TEAM_CONNECTION_PASSWORD']}".encode()).decode()
 
@@ -489,11 +499,12 @@ jobs:
           # The collection belongs to this job's source alone, so apart from the warm-up lines every row is the function's.
           QUERY = (f"SELECT toUnixTimestamp64Milli(dt) AS dt_ms, toUnixTimestamp64Milli(ingest_time) AS ingest_ms, raw "
                    f"FROM remote({env['COLLECTION']}_logs) WHERE position(raw, 'e2e warm-up run_id=') = 0 ORDER BY dt, _insert_index")
-          deadline = time.time() + int(env['WAIT_SECONDS'])
+          last_returned = invocations[-1]['returned_at']
+          deadline = time.time() + int(env['READBACK_SECONDS'])
           while True:
               rows = sql(QUERY)
-              print(f"{len(rows)}/{len(expected)} rows, {time.time() - returned_at / 1000:.0f} s after the invocation returned", flush=True)
-              if len(rows) >= len(expected) or time.time() > deadline:
+              print(f"{len(rows)}/{expected_rows} rows, {time.time() - last_returned / 1000:.0f} s after invocation {len(invocations)} returned", flush=True)
+              if len(rows) >= expected_rows or time.time() > deadline:
                   break
               time.sleep(5)
           if rows:
@@ -503,57 +514,78 @@ jobs:
           for row in rows:
               row['dt_ms'], row['ingest_ms'], row['raw'] = int(row['dt_ms']), int(row['ingest_ms']), json.loads(row['raw'])
 
+          # dt must be when the line was logged, i.e. during an invocation (2 s for the runner's clock against AWS's); the
+          # invocation it falls into is the one the row belongs to, since every invocation logs the same lines.
+          def invocation_of(row):
+              for k, invocation in enumerate(invocations, 1):
+                  if invocation['invoked_at'] - 2000 <= row['dt_ms'] <= invocation['returned_at'] + 2000:
+                      return k
+              return None
+
           problems = []
-          if len(rows) != len(expected):
-              problems.append(f"{len(rows)} rows stored within {env['WAIT_SECONDS']} s, the article's snippet logs {len(expected)} lines")
-          table, matched = [], []
-          for n, line in enumerate(expected, 1):
-              hits = [index for index, row in enumerate(rows) if line['message'] in str(row['raw'].get('message', ''))]
-              if len(hits) != 1:
-                  if hits or rows:
-                      problems.append(f"line {n} ({line['message']!r}) is in {len(hits)} rows, expected 1")
-                  table.append(f"| {n} | `{line['level']}` {line['message']} | ❌ {len(hits)} rows | | |")
-                  continue
-              row = rows[hits[0]]
-              matched.append(hits[0])
-              message = str(row['raw']['message'])
-              if language == 'node':
-                  # Lambda's text log format: "<time>\t<request id>\t<LEVEL>\t<message>"; console arguments are formatted into it.
-                  if f"\t{line['level']}\t{line['message']}" not in message:
-                      problems.append(f"line {n}: message {message!r} does not carry level {line['level']}")
-                  missing = [part for key, value in line['fields'].items() for part in [key] + ([value] if isinstance(value, str) else []) if part not in message]
-                  if missing:
-                      problems.append(f"line {n}: message {message!r} lacks {missing}")
-              else:
-                  if row['raw'].get('level') != line['level']:
-                      problems.append(f"line {n}: level {row['raw'].get('level')!r}, logged as {line['level']!r}")
-                  for key, value in line['fields'].items():
-                      if row['raw'].get(key) != value:
-                          problems.append(f"line {n}: field {key} is {row['raw'].get(key)!r}, logged as {value!r}")
-              # dt must be when the line was logged, i.e. during the invocation (2 s for the runner's clock against AWS's).
-              if not invoked_at - 2000 <= row['dt_ms'] <= returned_at + 2000:
-                  problems.append(f"line {n}: dt is {(row['dt_ms'] - invoked_at) / 1000:+.1f} s from the invocation's start, which took {(returned_at - invoked_at) / 1000:.1f} s")
-              delay = (row['ingest_ms'] - returned_at) / 1000
-              if delay > limit:
-                  problems.append(f"line {n}: Better Stack received it {delay:.1f} s after the invocation returned, more than {limit} s")
-              table.append(f"| {n} | `{line['level']}` {line['message']} | ✅ | {(row['dt_ms'] - invoked_at) / 1000:+.3f} s | {delay:.1f} s |")
-          if matched != sorted(matched):
-              problems.append('ordered by dt, the rows are not in the order the snippet logs them')
+          if len(rows) != expected_rows:
+              problems.append(f"{len(rows)} rows stored within {env['READBACK_SECONDS']} s of invocation {len(invocations)}, "
+                              f"expected the snippet's {len(lines)} lines from each of {len(invocations)} invocations")
+          for row in rows:
+              if invocation_of(row) is None:
+                  problems.append(f"a row's dt is outside every invocation, {(row['dt_ms'] - invocations[0]['invoked_at']) / 1000:+.1f} s "
+                                  f"from the first one's start: {str(row['raw'].get('message', ''))[:80]!r}")
+          table = []
+          for k, invocation in enumerate(invocations, 1):
+              matched = []
+              for n, line in enumerate(lines, 1):
+                  label = f"invocation {k} line {n}"
+                  hits = [index for index, row in enumerate(rows) if invocation_of(row) == k and line['message'] in str(row['raw'].get('message', ''))]
+                  if len(hits) != 1:
+                      if hits or rows:
+                          problems.append(f"{label} ({line['message']!r}) is in {len(hits)} rows, expected 1")
+                      table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ❌ {len(hits)} rows | | |")
+                      continue
+                  row = rows[hits[0]]
+                  matched.append(hits[0])
+                  message = str(row['raw']['message'])
+                  if language == 'node':
+                      # Lambda's text log format: "<time>\t<request id>\t<LEVEL>\t<message>"; console arguments are formatted into it.
+                      if f"\t{line['level']}\t{line['message']}" not in message:
+                          problems.append(f"{label}: message {message!r} does not carry level {line['level']}")
+                      missing = [part for key, value in line['fields'].items() for part in [key] + ([value] if isinstance(value, str) else []) if part not in message]
+                      if missing:
+                          problems.append(f"{label}: message {message!r} lacks {missing}")
+                  else:
+                      if row['raw'].get('level') != line['level']:
+                          problems.append(f"{label}: level {row['raw'].get('level')!r}, logged as {line['level']!r}")
+                      for key, value in line['fields'].items():
+                          if row['raw'].get(key) != value:
+                              problems.append(f"{label}: field {key} is {row['raw'].get(key)!r}, logged as {value!r}")
+                  delay = (row['ingest_ms'] - invocation['returned_at']) / 1000
+                  if delay > limit:
+                      problems.append(f"{label}: Better Stack received it {delay:.1f} s after invocation {k} returned, more than {limit} s")
+                  table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ✅ | {(row['dt_ms'] - invocation['invoked_at']) / 1000:+.3f} s | {delay:.1f} s |")
+              if matched != sorted(matched):
+                  problems.append(f"invocation {k}: ordered by dt, the rows are not in the order the snippet logs them")
 
           os.makedirs('out', exist_ok=True)
           with open('out/rows.json', 'w') as file:
               json.dump(rows, file, indent=2, ensure_ascii=False)
-          with open('out/summary.md', 'w') as file:
-              file.write(f"### {env['RUNTIME']} {env['ARCH']} `{env['NAME']}`\n\n"
-                         f"- source {env['SOURCE_ID']}, {env['PACKAGE_VERSIONS'].strip()}\n"
-                         f"- invoked once, took {(returned_at - invoked_at) / 1000:.1f} s; read back through `{env['CONNECT_HOST']}`\n\n"
-                         f"| # | logged | stored | dt from invocation start | received after invocation returned |\n|---|---|---|---|---|\n"
+          with open(f"out/readback-{env['READBACK']}.md", 'w') as file:
+              file.write(f"#### Read-back after invocation {len(invocations)}, waiting up to {env['READBACK_SECONDS']} s\n\n"
+                         f"| invocation | # | logged | stored | dt from invocation start | received after invocation returned |\n|---|---|---|---|---|---|\n"
                          + '\n'.join(table) + '\n\n'
-                         + ('\n'.join(f'- ❌ {problem}' for problem in problems) if problems else '✅ every line stored once, as logged, on time') + '\n')
-          print(open('out/summary.md').read())
+                         + ('\n'.join(f'- ❌ {problem}' for problem in problems) if problems else '✅ every line stored once per invocation, as logged, on time') + '\n')
+          print(open(f"out/readback-{env['READBACK']}.md").read())
           if problems:
               print('\n'.join(f'::error::{problem}' for problem in problems))
               sys.exit(1)
+
+      - name: "[Test] Invoke the function a second time"
+        run: *invoke
+
+      - name: "[Test] Read both invocations' lines back through the SQL API connection"
+        shell: python
+        env:
+          READBACK: second
+          READBACK_SECONDS: ${{ env.WAIT_SECONDS }}
+        run: *readback
 
       - name: "[Report] The function's own log"
         if: ${{ always() && env.FUNCTION_CREATED == 'true' }}
@@ -612,7 +644,15 @@ jobs:
       - name: "[Report] Job summary"
         if: ${{ always() }}
         run: |
-          if [ -f out/summary.md ]; then cat out/summary.md >> "$GITHUB_STEP_SUMMARY"; else echo "### $RUNTIME $ARCH: no summary, the job failed before the read-back" >> "$GITHUB_STEP_SUMMARY"; fi
+          {
+            echo "### $RUNTIME $ARCH \`$NAME\`"
+            echo
+            [ -z "${SOURCE_ID:-}" ] || echo "- source $SOURCE_ID, ${PACKAGE_VERSIONS:-}"
+            [ ! -f invocations.jsonl ] || jq -rs 'to_entries[] | "- invocation \(.key + 1) took \((.value.returned_at - .value.invoked_at) / 1000) s"' invocations.jsonl
+            echo
+            for readback in out/readback-first.md out/readback-second.md; do [ ! -f "$readback" ] || { cat "$readback"; echo; }; done
+            [ -f out/readback-first.md ] || echo "No read-back, the job failed before it."
+          } >> "$GITHUB_STEP_SUMMARY"
           [ -s out/rows.json ] && [ "$(jq length out/rows.json)" -gt 0 ] && { echo; echo '<details><summary>stored rows</summary>'; echo; echo '```json'; cat out/rows.json; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"
           [ -s out/function.log ] && { echo; echo "<details><summary>/aws/lambda/$NAME</summary>"; echo; echo '```'; cat out/function.log; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"
           [ -f out/cleanup.md ] && { echo; cat out/cleanup.md; } >> "$GITHUB_STEP_SUMMARY"

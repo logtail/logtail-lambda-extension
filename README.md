@@ -1,5 +1,6 @@
 # logtail-lambda-extension
 [![Test logtail-lambda-extension](https://github.com/logtail/logtail-lambda-extension/actions/workflows/test.yml/badge.svg)](https://github.com/logtail/logtail-lambda-extension/actions/workflows/test.yml)
+[![E2E](https://github.com/logtail/logtail-lambda-extension/actions/workflows/e2e.yml/badge.svg)](https://github.com/logtail/logtail-lambda-extension/actions/workflows/e2e.yml)
 
 [AWS Lambda Extension](https://docs.aws.amazon.com/lambda/latest/dg/lambda-extensions.html) that uses the [Lambda Telemetry API](https://docs.aws.amazon.com/lambda/latest/dg/telemetry-api-reference.html) to forward logs to a [Better Stack HTTP source](https://betterstack.com/docs/logs/http-rest-api/).
 

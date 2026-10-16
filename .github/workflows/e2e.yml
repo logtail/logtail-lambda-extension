@@ -1,0 +1,693 @@
+name: E2E
+
+# Follows the AWS Lambda docs article exactly as written, for both of its languages, in a throwaway AWS account:
+# - Node.js: gets the layer ZIP the way the article's first code block does, publishes it with the article's
+#   `aws lambda publish-layer-version` command, and runs one function per runtime and architecture that command lists,
+#   with the article's environment variables and its logging snippet as the handler.
+# - Python: installs the article's pip packages into the deployment package and runs a function whose module is the
+#   article's setup snippet and whose handler is the article's logging snippet.
+# Each function gets its own source. It is invoked once (a cold start, with the execution environment's
+# initialization) and a first read-back waits FIRST_WAIT_SECONDS for that invocation's lines; then LATER_INVOCATIONS
+# warm invocations follow INVOKE_INTERVAL_SECONDS apart, and a final read-back waits up to WAIT_SECONDS for every
+# invocation's lines. Lambda freezes the environment between invocations, so the report says for every line during
+# which invocation (or after the last one) Better Stack received it, which tells a cold-start delay from one that
+# repeats on warm invocations. Every line the snippet logs must be stored once per invocation, with the level and fields
+# it was logged with, a dt inside that invocation (which is how rows are told apart, every invocation logs the same
+# lines), in the order it was logged, and received by Better Stack (ingest_time) within DELIVERY_LIMIT_SECONDS of that
+# invocation returning. The source token
+# and ingesting host are filled in where the article shows its $SOURCE_TOKEN and $INGESTING_HOST placeholders, as the
+# article does for a signed-in reader. The docs job fails when the article's code blocks no longer have the shape this
+# test reads.
+# The layer job understands two shapes of that first block:
+# - Building this repository (`git clone` + `pnpm install` + `pnpm run build`): it runs the build with the latest pnpm,
+#   as a reader would. When that fails, the job fails and pnpm 8 (the lockfile's version) builds the layer instead, so
+#   the Lambda jobs still run. The checkout stands in for the clone; on the schedule that is main.
+# - Downloading the latest release (`curl -fsSLO …/releases/latest/download/<file>.zip`): the daily schedule downloads
+#   the ZIP the article links, pull requests and pushes to main build the checkout the way releases.yml does, which is
+#   what they would release.
+# Everything a job creates is named after NAME and deleted in its cleanup step, together with leftovers of earlier runs
+# of the same runtime and architecture older than two hours. Pull requests from forks are skipped: they get no OIDC
+# token.
+# See the docs article in https://betterstack.com/docs/logs/aws-lambda/
+#
+# AWS account: better-stack-e2e-lambda (352333568934), shared with logtail/logtail-aws-lambda's E2E. Root sign-in:
+# 1Password, Engineering vault, item "AWS better-stack-e2e-lambda". The account's CloudFormation stack `e2e-bootstrap`
+# holds the GitHub OIDC provider and IAM role `e2e-lambda-exec` the functions run as; the stack
+# `e2e-bootstrap-lambda-docs` adds IAM role `github-actions-e2e-lambda-docs`, which this workflow assumes. It trusts
+# this repository and may only touch functions, layers and log groups named `e2e-lambda-docs-*`, so it cannot reach
+# the other E2E's resources.
+# Secrets: TEST_TEAM_TELEMETRY_API, TEST_TEAM_CONNECTION_USERNAME, TEST_TEAM_CONNECTION_PASSWORD (the E2E testing team),
+# LINEAR_* (see notify_linear_failure.yml).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '45 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_ARN: arn:aws:iam::352333568934:role/github-actions-e2e-lambda-docs
+  LAMBDA_ROLE_ARN: arn:aws:iam::352333568934:role/e2e-lambda-exec
+  API: https://telemetry.betterstack.com
+  DOCS_URL: https://betterstack.com/docs/logs/aws-lambda/
+  RUN_ID: gh${{ github.run_id }}a${{ github.run_attempt }}
+  # The article asks for Python 3.7 or higher; these are the oldest and the newest Python runtimes Lambda supports.
+  PYTHON_RUNTIMES: python3.11 python3.14
+  DELIVERY_LIMIT_SECONDS: 60
+  # Rows become queryable some 10 to 20 s after Better Stack receives them.
+  FIRST_WAIT_SECONDS: 90
+  # After the first invocation (a cold start) and its read-back, the warm invocations; DELIVERY_LIMIT_SECONDS apart, so
+  # lines that wait for a later invocation miss the limit.
+  LATER_INVOCATIONS: 4
+  INVOKE_INTERVAL_SECONDS: 60
+  WAIT_SECONDS: 900
+  TEST_TEAM_TELEMETRY_API: ${{ secrets.TEST_TEAM_TELEMETRY_API }}
+  TEST_TEAM_CONNECTION_USERNAME: ${{ secrets.TEST_TEAM_CONNECTION_USERNAME }}
+  TEST_TEAM_CONNECTION_PASSWORD: ${{ secrets.TEST_TEAM_CONNECTION_PASSWORD }}
+
+jobs:
+  docs:
+    name: Docs article
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+      install: ${{ steps.read.outputs.install }}
+      layer_zip: ${{ steps.read.outputs.layer_zip }}
+      zip_url: ${{ steps.read.outputs.zip_url }}
+
+    steps:
+      - name: "[Setup] Fetch the article"
+        run: curl -sSfL "$DOCS_URL" -o docs.html
+
+      - name: "[Check] Read the article's code blocks"
+        id: read
+        shell: python
+        run: |
+          import ast, html, json, os, re, shlex, sys, textwrap
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          page = open('docs.html', encoding='utf-8').read()
+          blocks = [(language, html.unescape(re.sub(r'<[^>]+>', '', code)).strip())
+                    for language, code in re.findall(r"<pre class='highlight language-(\w+)'><code>(.*?)</code></pre>", page, re.S)]
+          ROLES = ['Node.js install', 'Node.js environment variables', 'Node.js logging', 'Python install', 'Python setup', 'Python logging']
+          LANGUAGES = ['bash', 'text', 'js', 'bash', 'python', 'python']
+          if [language for language, _ in blocks] != LANGUAGES:
+              sys.exit(f"::error::{os.environ['DOCS_URL']} changed: its code blocks are now {[language for language, _ in blocks]}, "
+                       f"this test reads {LANGUAGES} as {ROLES}")
+          node_install, node_env, node_logging, python_install, python_setup, python_logging = [code for _, code in blocks]
+          PLACEHOLDERS = {'$SOURCE_TOKEN', '$INGESTING_HOST'}
+          problems = []
+
+          # Node.js install: build this repository or download its latest release, then publish the ZIP as a layer.
+          commands = [line.strip() for line in node_install.replace('\\\n', ' ').splitlines() if line.strip()]
+          BUILD = [f'git clone git@github.com:{repository}.git', f'cd {repository.split("/")[1]}', 'pnpm install', 'pnpm run build']
+          download = re.fullmatch(rf'curl -fsSLO (https://github\.com/{re.escape(repository)}/releases/latest/download/([\w.-]+\.zip))', commands[0]) if len(commands) == 2 else None
+          install, zip_url, zip_name = None, '', ''
+          if commands[:-1] == BUILD:
+              install = 'build'
+          elif download:
+              install, zip_url, zip_name = 'download', download[1], download[2]
+          else:
+              problems.append(f'Node.js install commands are {commands[:-1]}, this test runs either {BUILD} or '
+                              f'["curl -fsSLO https://github.com/{repository}/releases/latest/download/<file>.zip"]')
+          publish = shlex.split(commands[-1]) if commands else []
+          options, option = {}, None
+          for word in publish[3:]:
+              if word.startswith('--'):
+                  option = word
+                  options[option] = []
+              elif option:
+                  options[option].append(word)
+              else:
+                  options.setdefault(None, []).append(word)
+          if (publish[:3] != ['aws', 'lambda', 'publish-layer-version']
+                  or sorted(options, key=str) != ['--compatible-architectures', '--compatible-runtimes', '--layer-name', '--zip-file']
+                  or len(options['--zip-file']) != 1 or not options['--zip-file'][0].startswith('fileb://')
+                  or len(options['--layer-name']) != 1
+                  or not all(re.fullmatch(r'nodejs\d+\.x', runtime) for runtime in options['--compatible-runtimes'])
+                  or not set(options['--compatible-architectures']) <= {'x86_64', 'arm64'}):
+              problems.append(f'the layer publish command is {commands[-1:]}, this test reads --layer-name, --zip-file fileb://…, '
+                              f'--compatible-runtimes nodejs<N>.x … and --compatible-architectures x86_64/arm64')
+              options = {'--zip-file': ['fileb://'], '--compatible-runtimes': [], '--compatible-architectures': []}
+          if install == 'download' and options['--zip-file'][0].removeprefix('fileb://').removeprefix('./') != zip_name:
+              problems.append(f"the layer publish command uploads {options['--zip-file'][0]}, the article downloads {zip_name}")
+
+          # Node.js environment variables: "NAME: value" lines, values may carry the article's placeholders.
+          environment = {}
+          for line in node_env.splitlines():
+              match = re.fullmatch(r'\s*([A-Z][A-Z0-9_]*):\s*(\S+)\s*', line)
+              if not match:
+                  problems.append(f'Node.js environment variable line {line!r} is not "NAME: value"')
+                  continue
+              environment[match[1]] = match[2]
+          unknown = {placeholder for value in environment.values() for placeholder in re.findall(r'\$[A-Z_]+', value)} - PLACEHOLDERS
+          if unknown:
+              problems.append(f'Node.js environment variables use placeholders this test cannot fill: {sorted(unknown)}')
+
+          # Node.js logging: console.<method>('message'[, {fields}]) calls, in the Lambda text format's level names.
+          LAMBDA_LEVELS = {'log': 'INFO', 'info': 'INFO', 'warn': 'WARN', 'error': 'ERROR', 'debug': 'DEBUG', 'trace': 'TRACE'}
+          CALL = re.compile(r"console\.(\w+)\(\s*'([^'\\]*)'\s*(?:,\s*(\{[^{}]*\})\s*)?\)\s*;?", re.S)
+          node_lines = []
+          for call in CALL.finditer(node_logging):
+              try:
+                  fields = json.loads(call[3].replace("'", '"')) if call[3] else {}
+              except ValueError:
+                  problems.append(f'cannot read the fields of {call[0]!r}')
+                  fields = {}
+              if call[1] not in LAMBDA_LEVELS:
+                  problems.append(f'console.{call[1]} has no known Lambda log level')
+              node_lines.append({'level': LAMBDA_LEVELS.get(call[1]), 'message': call[2], 'fields': fields})
+          if CALL.sub('', node_logging).strip() or not node_lines:
+              problems.append(f'the Node.js logging snippet holds code this test cannot read: {CALL.sub("", node_logging).strip()!r}')
+
+          # Python install: "pip3 install <package>" lines.
+          packages = []
+          for line in python_install.splitlines():
+              words = line.split()
+              if len(words) == 3 and words[:2] == ['pip3', 'install']:
+                  packages.append(words[2])
+              else:
+                  problems.append(f'Python install line {line!r} is not "pip3 install <package>"')
+
+          # Python setup: module code with both placeholders.
+          try:
+              ast.parse(python_setup)
+          except SyntaxError as error:
+              problems.append(f'the Python setup snippet does not parse: {error}')
+          if set(re.findall(r'\$[A-Z_]+', python_setup)) != PLACEHOLDERS:
+              problems.append(f'the Python setup snippet has placeholders {sorted(set(re.findall(r"[$][A-Z_]+", python_setup)))}, expected {sorted(PLACEHOLDERS)}')
+
+          # Python logging: logger.<level>('message'[, extra={fields}]) calls.
+          python_lines = []
+          try:
+              statements = ast.parse(python_logging).body
+          except SyntaxError as error:
+              problems.append(f'the Python logging snippet does not parse: {error}')
+              statements = []
+          for statement in statements:
+              call = statement.value if isinstance(statement, ast.Expr) else None
+              if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                      and call.func.value.id == 'logger' and len(call.args) == 1 and isinstance(call.args[0], ast.Constant)
+                      and all(keyword.arg == 'extra' for keyword in call.keywords)):
+                  problems.append(f'the Python logging snippet holds code this test cannot read: {ast.unparse(statement)!r}')
+                  continue
+              fields = ast.literal_eval(call.keywords[0].value) if call.keywords else {}
+              python_lines.append({'level': call.func.attr, 'message': call.args[0].value, 'fields': fields})
+          if not python_lines:
+              problems.append('the Python logging snippet logs nothing')
+
+          if problems:
+              print('\n'.join(f"::error::{os.environ['DOCS_URL']} changed, this test no longer matches it: {problem}" for problem in problems))
+              sys.exit(1)
+
+          os.makedirs('article', exist_ok=True)
+          # The article shows the logging snippets without a handler around them; they become the handler's body.
+          with open('article/index.mjs', 'w') as file:
+              file.write('export const handler = async () => {\n' + textwrap.indent(node_logging, '  ') + '\n};\n')
+          with open('article/lambda_function.py', 'w') as file:
+              file.write(python_setup + '\n\n\ndef lambda_handler(event, context):\n' + textwrap.indent(python_logging, '    ') + '\n')
+          with open('article/article.json', 'w') as file:
+              json.dump({
+                  'layer': {'runtimes': options['--compatible-runtimes'], 'architectures': options['--compatible-architectures']},
+                  'environment': environment,
+                  'packages': packages,
+                  'lines': {'node': node_lines, 'python': python_lines},
+              }, file, indent=2)
+
+          include = [{'language': 'node', 'runtime': runtime, 'arch': arch, 'variant': f"{runtime.replace('.', '')}-{arch}"}
+                     for runtime in options['--compatible-runtimes'] for arch in options['--compatible-architectures']]
+          include += [{'language': 'python', 'runtime': runtime, 'arch': 'x86_64', 'variant': f"{runtime.replace('.', '')}-x86_64",
+                       'python': runtime.removeprefix('python')} for runtime in os.environ['PYTHON_RUNTIMES'].split()]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"matrix={json.dumps({'include': include})}\n")
+              output.write(f"install={install}\n")
+              output.write(f"layer_zip={options['--zip-file'][0].removeprefix('fileb://')}\n")
+              output.write(f"zip_url={zip_url}\n")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"### Docs article\n\n{os.environ['DOCS_URL']} matches what this test runs:\n\n"
+                            f"- layer {'built from this repository' if install == 'build' else f'downloaded from {zip_url}'}, "
+                            f"for {', '.join(options['--compatible-runtimes'])} on {', '.join(options['--compatible-architectures'])}\n"
+                            f"- Node.js environment variables {', '.join(f'`{name}: {value}`' for name, value in environment.items())}\n"
+                            f"- Python packages {', '.join(f'`{package}`' for package in packages)}, tested on {os.environ['PYTHON_RUNTIMES']}\n"
+                            f"- {len(node_lines)} Node.js and {len(python_lines)} Python log lines\n")
+          print(json.dumps(include, indent=2))
+
+      - name: "[Setup] Share the article's snippets with the Lambda jobs"
+        uses: actions/upload-artifact@v7
+        with:
+          name: article
+          path: article/
+          if-no-files-found: error
+
+  layer:
+    name: Layer ZIP as documented
+    needs: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      INSTALL: ${{ needs.docs.outputs.install }}
+      LAYER_ZIP: ${{ needs.docs.outputs.layer_zip }}
+      ZIP_URL: ${{ needs.docs.outputs.zip_url }}
+    outputs:
+      layer_from: ${{ steps.collect.outputs.layer_from }}
+
+    steps:
+      - name: "[Setup] Checkout code"
+        uses: actions/checkout@v7
+
+      - name: "[Setup] Node.js 22, the article's minimum"
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+
+      # Outside pnpm's CI mode, as in a reader's terminal.
+      - name: "[Test] The article's pnpm install and pnpm run build with the latest pnpm"
+        id: latest
+        if: ${{ env.INSTALL == 'build' }}
+        continue-on-error: true
+        run: |
+          npm install --global pnpm@latest
+          echo "LATEST_PNPM=$(pnpm --version)" >> "$GITHUB_ENV"
+          env -u CI pnpm install
+          env -u CI pnpm run build
+
+      - name: "[Setup] Build with pnpm 8, the lockfile's version, so the Lambda jobs still run"
+        if: ${{ steps.latest.outcome == 'failure' }}
+        run: |
+          git checkout -- .
+          git clean -fdxq
+          npm install --global pnpm@8
+          env -u CI pnpm install
+          env -u CI pnpm run build
+
+      - name: "[Test] The article's curl -fsSLO of the latest release"
+        if: ${{ env.INSTALL == 'download' && github.event_name == 'schedule' }}
+        run: |
+          curl -fsSLO "$ZIP_URL"
+          RELEASE_TAG=$(curl -sSI "$ZIP_URL" | tr -d '\r' | sed -nE 's#^[Ll]ocation: .*/releases/download/([^/]+)/.*#\1#p' | head -1)
+          echo "LAYER_FROM=release ${RELEASE_TAG:-unknown} from $ZIP_URL" >> "$GITHUB_ENV"
+
+      - name: "[Setup] Build the checkout the way releases.yml does"
+        if: ${{ env.INSTALL == 'download' && github.event_name != 'schedule' }}
+        run: |
+          npm install --global pnpm@8
+          pnpm install
+          pnpm run build
+          [ -f "dist/$LAYER_ZIP" ] || { echo "::error::the article publishes $LAYER_ZIP, the build made $(ls dist | tr '\n' ' ')"; exit 1; }
+          cp "dist/$LAYER_ZIP" "$LAYER_ZIP"
+          echo "LAYER_FROM=$(git rev-parse --short HEAD) built with pnpm $(pnpm --version) as releases.yml does" >> "$GITHUB_ENV"
+
+      - name: "[Setup] Share the ZIP the article publishes with the Lambda jobs"
+        id: collect
+        run: |
+          if [ "$INSTALL" = build ]; then LAYER_FROM="$(git rev-parse --short HEAD) built with pnpm $(pnpm --version)"; fi
+          [ -f "$LAYER_ZIP" ] || { echo "::error::the article publishes $LAYER_ZIP, which its install steps did not make; dist/ holds $(ls dist 2>/dev/null | tr '\n' ' ')"; exit 1; }
+          mkdir layer
+          cp "$LAYER_ZIP" layer/layer.zip
+          echo "layer_from=$LAYER_FROM" >> "$GITHUB_OUTPUT"
+          echo "$LAYER_FROM, $(stat -c %s layer/layer.zip) bytes:"
+          unzip -Z layer/layer.zip
+
+      - name: "[Setup] Upload the ZIP"
+        uses: actions/upload-artifact@v7
+        with:
+          name: layer
+          path: layer/layer.zip
+          if-no-files-found: error
+
+      - name: "[Report] Layer ZIP"
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Layer ZIP"
+            echo
+            if [ "$INSTALL" = build ] && [ "${{ steps.latest.outcome }}" = success ]; then
+              echo "- ✅ the article's \`pnpm install\` + \`pnpm run build\` with the latest pnpm ($LATEST_PNPM) on Node.js $(node --version)"
+            elif [ "$INSTALL" = build ]; then
+              echo "- ❌ the article's \`pnpm install\` + \`pnpm run build\` failed with the latest pnpm (${LATEST_PNPM:-unknown}) on Node.js $(node --version), see the step log"
+            fi
+            echo "- the Lambda jobs publish ${{ steps.collect.outputs.layer_from || 'nothing: no ZIP was made' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$INSTALL" = build ] && [ "${{ steps.latest.outcome }}" != success ]; then
+            echo "::error::the article's pnpm install + pnpm run build failed with the latest pnpm (${LATEST_PNPM:-unknown})"
+            exit 1
+          fi
+
+  lambda:
+    name: ${{ matrix.runtime }} ${{ matrix.arch }}
+    needs: [docs, layer]
+    # Runs when only the latest-pnpm build failed: the layer job then shares the pnpm 8 build. Python needs no layer.
+    if: ${{ !cancelled() && needs.docs.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.docs.outputs.matrix) }}
+    env:
+      LANGUAGE: ${{ matrix.language }}
+      RUNTIME: ${{ matrix.runtime }}
+      ARCH: ${{ matrix.arch }}
+      NAME: e2e-lambda-docs-${{ matrix.variant }}-gh${{ github.run_id }}a${{ github.run_attempt }}
+      NAME_PREFIX: e2e-lambda-docs-${{ matrix.variant }}-gh
+
+    steps:
+      - name: "[Setup] AWS credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "[Setup] The article's snippets"
+        uses: actions/download-artifact@v8
+        with:
+          name: article
+          path: article
+
+      - name: "[Setup] The layer ZIP"
+        if: ${{ matrix.language == 'node' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: layer
+          path: layer
+
+      - name: "[Setup] Python ${{ matrix.python }}, matching the runtime"
+        if: ${{ matrix.language == 'python' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: "[Setup] Create the source"
+        run: |
+          PLATFORM=${{ matrix.language == 'node' && 'javascript' || 'python' }}
+          RES=$(curl -sS -X POST "$API/api/v1/sources" -H "Authorization: Bearer $TEST_TEAM_TELEMETRY_API" -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg name "$NAME" --arg platform "$PLATFORM" '{name: $name, platform: $platform}')")
+          jq -e '.data.id' <<<"$RES" >/dev/null || { echo "::error::creating the source failed: $RES"; exit 1; }
+          SOURCE_TOKEN=$(jq -r '.data.attributes.token' <<<"$RES")
+          echo "::add-mask::$SOURCE_TOKEN"
+          {
+            echo "SOURCE_ID=$(jq -r '.data.id' <<<"$RES")"
+            echo "SOURCE_TOKEN=$SOURCE_TOKEN"
+            echo "INGESTING_HOST=$(jq -r '.data.attributes.ingesting_host' <<<"$RES")"
+            echo "COLLECTION=t$(jq -r '.data.attributes.team_id' <<<"$RES")_$(jq -r '.data.attributes.table_name' <<<"$RES")"
+            echo "CONNECT_HOST=$(jq -r '.data.attributes.data_region' <<<"$RES")-connect.betterstackdata.com"
+          } >> "$GITHUB_ENV"
+          echo "$PLATFORM source $(jq -r '.data.id' <<<"$RES") on $(jq -r '.data.attributes.data_region' <<<"$RES")"
+
+      # A fresh token reaches the ingesters with a delay; until then they answer 401. Send warm-up lines until 20 in a
+      # row are accepted, then let it settle, so a late line is never the token's fault.
+      - name: "[Setup] Warm up the source until ingest accepts its token"
+        run: |
+          STREAK=0
+          DEADLINE=$((SECONDS + 300))
+          while [ "$STREAK" -lt 20 ]; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "https://$INGESTING_HOST/" -H "Authorization: Bearer $SOURCE_TOKEN" -H 'Content-Type: application/json' -d "{\"message\":\"e2e warm-up run_id=$RUN_ID\"}")
+            if [ "$CODE" = 202 ]; then STREAK=$((STREAK + 1)); else echo "ingest answered HTTP $CODE after $STREAK accepted"; STREAK=0; fi
+            [ "$SECONDS" -lt "$DEADLINE" ] || { echo "::error::ingest did not accept the source token 20 times in a row within 5 min"; exit 1; }
+            sleep 1
+          done
+          sleep 15
+          echo "ingest accepts the token"
+
+      - name: "[Test] Publish the layer with the article's command"
+        if: ${{ matrix.language == 'node' }}
+        run: |
+          LAYER_ARN=$(aws lambda publish-layer-version --layer-name "$NAME" --zip-file fileb://layer/layer.zip \
+            --compatible-runtimes $(jq -r '.layer.runtimes | join(" ")' article/article.json) \
+            --compatible-architectures $(jq -r '.layer.architectures | join(" ")' article/article.json) \
+            --query LayerVersionArn --output text)
+          echo "LAYER_ARN=$LAYER_ARN" >> "$GITHUB_ENV"
+          echo "published $LAYER_ARN"
+
+      - name: "[Test] Package the function from the article's snippets"
+        run: |
+          mkdir package
+          if [ "$LANGUAGE" = node ]; then
+            cp article/index.mjs package/index.mjs
+            echo "PACKAGE_VERSIONS=layer ${{ needs.layer.outputs.layer_from }}" >> "$GITHUB_ENV"
+          else
+            pip3 install --quiet --target package $(jq -r '.packages | join(" ")' article/article.json)
+            # The placeholders in the article's setup snippet are filled in as the article does for a signed-in reader.
+            CODE=$(cat article/lambda_function.py)
+            CODE=${CODE//'$SOURCE_TOKEN'/$SOURCE_TOKEN}
+            CODE=${CODE//'$INGESTING_HOST'/$INGESTING_HOST}
+            printf '%s\n' "$CODE" > package/lambda_function.py
+            echo "PACKAGE_VERSIONS=$(cd package && ls -d *.dist-info | sed -E 's/\.dist-info$//' | grep -iE "^($(jq -r '.packages | map(gsub("-"; "_")) | join("|")' article/article.json))-" | tr '\n' ' ')" >> "$GITHUB_ENV"
+          fi
+          (cd package && zip -qr ../function.zip .)
+          echo "$(unzip -l function.zip | tail -1)"
+
+      - name: "[Test] Create the function with the article's settings"
+        run: |
+          if [ "$LANGUAGE" = node ]; then
+            # The article's environment variables, with its placeholders filled in.
+            ENVIRONMENT=$(jq -c --arg token "$SOURCE_TOKEN" --arg host "$INGESTING_HOST" '{Variables: (.environment | map_values(gsub("\\$SOURCE_TOKEN"; $token) | gsub("\\$INGESTING_HOST"; $host)))}' article/article.json)
+            SETTINGS=(--handler index.handler --layers "$LAYER_ARN" --environment "$ENVIRONMENT")
+          else
+            SETTINGS=(--handler lambda_function.lambda_handler)
+          fi
+          # The response would echo the environment variables, token included; nothing of it is needed.
+          aws lambda create-function --function-name "$NAME" --runtime "$RUNTIME" --architectures "$ARCH" --role "$LAMBDA_ROLE_ARN" \
+            --zip-file fileb://function.zip "${SETTINGS[@]}" >/dev/null
+          echo "FUNCTION_CREATED=true" >> "$GITHUB_ENV"
+          aws lambda wait function-active-v2 --function-name "$NAME"
+          echo "created $NAME on $RUNTIME $ARCH"
+
+      - name: "[Test] Invoke the function (a cold start)"
+        env:
+          COUNT: 1
+        run: &invoke |
+          for i in $(seq "$COUNT"); do
+            [ "$i" = 1 ] || sleep "$INVOKE_INTERVAL_SECONDS"
+            INVOKED_AT_MS=$(date +%s%3N)
+            aws lambda invoke --function-name "$NAME" --log-type Tail --cli-read-timeout 120 response.json > invoke.json
+            RETURNED_AT_MS=$(date +%s%3N)
+            TAIL=$(jq -r '.LogResult' invoke.json | base64 -d)
+            # Lambda reports an init duration for the invocation that started the execution environment only.
+            INIT_MS=$(sed -nE 's/.*Init Duration: ([0-9.]+) ms.*/\1/p' <<<"$TAIL" | head -1)
+            jq -nc --argjson invoked "$INVOKED_AT_MS" --argjson returned "$RETURNED_AT_MS" --arg init "$INIT_MS" \
+              '{invoked_at: $invoked, returned_at: $returned, init_ms: ($init | if . == "" then null else tonumber end)}' >> invocations.jsonl
+            echo "invocation $(wc -l < invocations.jsonl) took $((RETURNED_AT_MS - INVOKED_AT_MS)) ms, response $(cat response.json), its log tail:"
+            echo "$TAIL"
+            jq -e '.StatusCode == 200 and .FunctionError == null' invoke.json >/dev/null || { echo "::error::the invocation failed: $(jq -c 'del(.LogResult)' invoke.json)"; exit 1; }
+          done
+
+      # Its verdict is the final read-back's too, which also tells when these lines arrived.
+      - name: "[Test] Read the first invocation's lines back through the SQL API connection"
+        continue-on-error: true
+        shell: python
+        env:
+          READBACK: first
+          READBACK_SECONDS: ${{ env.FIRST_WAIT_SECONDS }}
+        run: &readback |
+          import base64, json, os, sys, time, urllib.error, urllib.request
+
+          env = os.environ
+          language = env['LANGUAGE']
+          lines = json.load(open('article/article.json'))['lines'][language]
+          invocations = [json.loads(line) for line in open('invocations.jsonl') if line.strip()]
+          expected_rows = len(lines) * len(invocations)
+          limit = int(env['DELIVERY_LIMIT_SECONDS'])
+          credentials = base64.b64encode(f"{env['TEST_TEAM_CONNECTION_USERNAME']}:{env['TEST_TEAM_CONNECTION_PASSWORD']}".encode()).decode()
+
+          def sql(query):
+              request = urllib.request.Request(f"https://{env['CONNECT_HOST']}/", data=f'{query} FORMAT JSONEachRow'.encode(),
+                                               headers={'Authorization': f'Basic {credentials}', 'Content-Type': 'plain/text'})
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      return [json.loads(line) for line in response.read().decode().splitlines() if line]
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode()
+                  # A source's collection exists only from its first stored row on; until then the query is "no rows yet".
+                  if error.code == 500 and 'CLUSTER_DOESNT_EXIST' in body:
+                      return []
+                  sys.exit(f"::error::SQL API on {env['CONNECT_HOST']} answered HTTP {error.code}: {body[:300]}")
+
+          # The collection belongs to this job's source alone, so apart from the warm-up lines every row is the function's.
+          QUERY = (f"SELECT toUnixTimestamp64Milli(dt) AS dt_ms, toUnixTimestamp64Milli(ingest_time) AS ingest_ms, raw "
+                   f"FROM remote({env['COLLECTION']}_logs) WHERE position(raw, 'e2e warm-up run_id=') = 0 ORDER BY dt, _insert_index")
+          last_returned = invocations[-1]['returned_at']
+          deadline = time.time() + int(env['READBACK_SECONDS'])
+          while True:
+              rows = sql(QUERY)
+              print(f"{len(rows)}/{expected_rows} rows, {time.time() - last_returned / 1000:.0f} s after invocation {len(invocations)} returned", flush=True)
+              if len(rows) >= expected_rows or time.time() > deadline:
+                  break
+              time.sleep(5)
+          if rows:
+              # A last look 30 s later catches duplicate delivery.
+              time.sleep(30)
+              rows = sql(QUERY)
+          for row in rows:
+              row['dt_ms'], row['ingest_ms'], row['raw'] = int(row['dt_ms']), int(row['ingest_ms']), json.loads(row['raw'])
+
+          # dt must be when the line was logged, i.e. during an invocation (2 s for the runner's clock against AWS's); the
+          # invocation it falls into is the one the row belongs to, since every invocation logs the same lines.
+          def invocation_of(row):
+              for k, invocation in enumerate(invocations, 1):
+                  if invocation['invoked_at'] - 2000 <= row['dt_ms'] <= invocation['returned_at'] + 2000:
+                      return k
+              return None
+
+          # When Better Stack received a line, relative to the invocations: during one (1 s for the runner's clock against
+          # AWS's), or after the one before it.
+          def received_during(ms):
+              for k, invocation in enumerate(invocations, 1):
+                  if invocation['invoked_at'] - 1000 <= ms <= invocation['returned_at'] + 1000:
+                      return f'during {k}'
+              earlier = [k for k, invocation in enumerate(invocations, 1) if invocation['returned_at'] < ms]
+              return f'after {earlier[-1]}' if earlier else 'before 1'
+
+          problems = []
+          if len(rows) != expected_rows:
+              problems.append(f"{len(rows)} rows stored within {env['READBACK_SECONDS']} s of invocation {len(invocations)}, "
+                              f"expected the snippet's {len(lines)} lines from each of {len(invocations)} invocations")
+          for row in rows:
+              if invocation_of(row) is None:
+                  problems.append(f"a row's dt is outside every invocation, {(row['dt_ms'] - invocations[0]['invoked_at']) / 1000:+.1f} s "
+                                  f"from the first one's start: {str(row['raw'].get('message', ''))[:80]!r}")
+          table = []
+          for k, invocation in enumerate(invocations, 1):
+              matched = []
+              for n, line in enumerate(lines, 1):
+                  label = f"invocation {k} line {n}"
+                  hits = [index for index, row in enumerate(rows) if invocation_of(row) == k and line['message'] in str(row['raw'].get('message', ''))]
+                  if len(hits) != 1:
+                      if hits or rows:
+                          problems.append(f"{label} ({line['message']!r}) is in {len(hits)} rows, expected 1")
+                      table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ❌ {len(hits)} rows | | | |")
+                      continue
+                  row = rows[hits[0]]
+                  matched.append(hits[0])
+                  message = str(row['raw']['message'])
+                  if language == 'node':
+                      # Lambda's text log format: "<time>\t<request id>\t<LEVEL>\t<message>"; console arguments are formatted into it.
+                      if f"\t{line['level']}\t{line['message']}" not in message:
+                          problems.append(f"{label}: message {message!r} does not carry level {line['level']}")
+                      missing = [part for key, value in line['fields'].items() for part in [key] + ([value] if isinstance(value, str) else []) if part not in message]
+                      if missing:
+                          problems.append(f"{label}: message {message!r} lacks {missing}")
+                  else:
+                      if row['raw'].get('level') != line['level']:
+                          problems.append(f"{label}: level {row['raw'].get('level')!r}, logged as {line['level']!r}")
+                      for key, value in line['fields'].items():
+                          if row['raw'].get(key) != value:
+                              problems.append(f"{label}: field {key} is {row['raw'].get(key)!r}, logged as {value!r}")
+                  delay = (row['ingest_ms'] - invocation['returned_at']) / 1000
+                  if delay > limit:
+                      problems.append(f"{label}: Better Stack received it {delay:.1f} s after invocation {k} returned, more than {limit} s")
+                  table.append(f"| {k} | {n} | `{line['level']}` {line['message']} | ✅ | {(row['dt_ms'] - invocation['invoked_at']) / 1000:+.3f} s "
+                               f"| {delay:.1f} s | {received_during(row['ingest_ms'])} |")
+              if matched != sorted(matched):
+                  problems.append(f"invocation {k}: ordered by dt, the rows are not in the order the snippet logs them")
+
+          os.makedirs('out', exist_ok=True)
+          with open('out/rows.json', 'w') as file:
+              json.dump(rows, file, indent=2, ensure_ascii=False)
+          with open(f"out/readback-{env['READBACK']}.md", 'w') as file:
+              file.write(f"#### Read-back after invocation {len(invocations)}, waiting up to {env['READBACK_SECONDS']} s\n\n"
+                         f"| invocation | # | logged | stored | dt from invocation start | received after invocation returned | received during/after invocation |\n|---|---|---|---|---|---|---|\n"
+                         + '\n'.join(table) + '\n\n'
+                         + ('\n'.join(f'- ❌ {problem}' for problem in problems) if problems else '✅ every line stored once per invocation, as logged, on time') + '\n')
+          print(open(f"out/readback-{env['READBACK']}.md").read())
+          if problems:
+              print('\n'.join(f'::error::{problem}' for problem in problems))
+              sys.exit(1)
+
+      - name: "[Test] Invoke the function ${{ env.LATER_INVOCATIONS }} more times, ${{ env.INVOKE_INTERVAL_SECONDS }} s apart"
+        env:
+          COUNT: ${{ env.LATER_INVOCATIONS }}
+        run: *invoke
+
+      - name: "[Test] Read every invocation's lines back through the SQL API connection"
+        shell: python
+        env:
+          READBACK: final
+          READBACK_SECONDS: ${{ env.WAIT_SECONDS }}
+        run: *readback
+
+      - name: "[Report] The function's own log"
+        if: ${{ always() && env.FUNCTION_CREATED == 'true' }}
+        run: |
+          mkdir -p out
+          if EVENTS=$(aws logs filter-log-events --log-group-name "/aws/lambda/$NAME" --query 'events[].[timestamp,message]' --output json); then
+            jq -r '.[] | "\(.[0] / 1000 | strftime("%H:%M:%S")) \(.[1] | rtrimstr("\n"))"' <<<"$EVENTS" | tee out/function.log
+          else
+            echo "no log group /aws/lambda/$NAME yet"
+          fi
+
+      - name: "[Cleanup] Delete this job's resources in Better Stack and AWS (and stale ones)"
+        if: ${{ always() }}
+        run: |
+          set -o pipefail
+          mkdir -p out
+          say() { echo "$1"; echo "$1" >> out/cleanup.md; }
+          could_not_list() { say "- ❌ could not list $1, so none were deleted"; touch cleanup.failed; }
+          say "#### Cleanup"
+          say ""
+          STALE_BEFORE=$(date -u -d '-2 hours' +%FT%TZ)
+          # Names are e2e-lambda-docs-<runtime>-<arch>-gh<run id>a<attempt>; the prefix up to "-gh" is this job's alone.
+          SOURCES=$(curl -sS --fail-with-body "$API/api/v1/sources?name=$NAME_PREFIX&per_page=250" -H "Authorization: Bearer $TEST_TEAM_TELEMETRY_API" \
+            | jq -r --arg name "$NAME" --arg prefix "$NAME_PREFIX" --arg before "$STALE_BEFORE" '.data[] | select((.attributes.name | startswith($prefix)) and (.attributes.name == $name or .attributes.created_at < $before)) | "\(.id) \(.attributes.name)"') || { could_not_list sources; SOURCES=""; }
+          while read -r id name; do
+            [ -n "$id" ] || continue
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "$API/api/v1/sources/$id" -H "Authorization: Bearer $TEST_TEAM_TELEMETRY_API")
+            [ "$CODE" = 204 ] && say "- deleted source $id \`$name\`" || { say "- ❌ could not delete source $id \`$name\` (HTTP $CODE)"; touch cleanup.failed; }
+          done <<<"$SOURCES"
+          # Credentials are the job's first step, so without them it created nothing in AWS; the next run sweeps leftovers.
+          if aws sts get-caller-identity >/dev/null 2>&1; then
+            FUNCTIONS=$(aws lambda list-functions --query "Functions[?starts_with(FunctionName, '$NAME_PREFIX')].[FunctionName,LastModified]" --output json \
+              | jq -r --arg name "$NAME" --arg before "$STALE_BEFORE" '.[] | select(.[0] == $name or .[1] < $before) | .[0]') || { could_not_list functions; FUNCTIONS=""; }
+            for fn in $FUNCTIONS; do
+              if aws lambda delete-function --function-name "$fn"; then say "- deleted function \`$fn\`"; else say "- ❌ could not delete function \`$fn\`"; touch cleanup.failed; fi
+            done
+            LAYERS=$(aws lambda list-layers --query "Layers[?starts_with(LayerName, '$NAME_PREFIX')].[LayerName,LatestMatchingVersion.CreatedDate]" --output json \
+              | jq -r --arg name "$NAME" --arg before "$STALE_BEFORE" '.[] | select(.[0] == $name or .[1] < $before) | .[0]') || { could_not_list layers; LAYERS=""; }
+            for layer in $LAYERS; do
+              VERSIONS=$(aws lambda list-layer-versions --layer-name "$layer" --query 'LayerVersions[].Version' --output text) || { could_not_list "versions of layer $layer"; continue; }
+              for version in $VERSIONS; do
+                if aws lambda delete-layer-version --layer-name "$layer" --version-number "$version"; then say "- deleted layer \`$layer:$version\`"; else say "- ❌ could not delete layer \`$layer:$version\`"; touch cleanup.failed; fi
+              done
+            done
+            LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/$NAME_PREFIX" --query 'logGroups[].[logGroupName,creationTime]' --output json \
+              | jq -r --arg name "/aws/lambda/$NAME" --argjson before "$(( $(date -u -d '-2 hours' +%s) * 1000 ))" '.[] | select(.[0] == $name or .[1] < $before) | .[0]') || { could_not_list "log groups"; LOG_GROUPS=""; }
+            for group in $LOG_GROUPS; do
+              if aws logs delete-log-group --log-group-name "$group"; then say "- deleted log group \`$group\`"; else say "- ❌ could not delete log group \`$group\`"; touch cleanup.failed; fi
+            done
+          else
+            say "- no AWS credentials: the job stopped before it could create anything in AWS"
+          fi
+          [ "$(wc -l < out/cleanup.md)" -gt 2 ] || say "- nothing to delete"
+          [ ! -f cleanup.failed ] || { say ""; say "❌ cleanup left resources behind"; exit 1; }
+
+      - name: "[Report] Job summary"
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### $RUNTIME $ARCH \`$NAME\`"
+            echo
+            [ -z "${SOURCE_ID:-}" ] || echo "- source $SOURCE_ID, ${PACKAGE_VERSIONS:-}"
+            [ ! -f invocations.jsonl ] || jq -rs 'to_entries[] | "- invocation \(.key + 1) at \(.value.invoked_at / 1000 | strftime("%H:%M:%S")), took \((.value.returned_at - .value.invoked_at) / 1000) s\(if .value.init_ms then ", a cold start with \(.value.init_ms) ms of init" else "" end)"' invocations.jsonl
+            echo
+            for readback in out/readback-first.md out/readback-final.md; do [ ! -f "$readback" ] || { cat "$readback"; echo; }; done
+            [ -f out/readback-first.md ] || echo "No read-back, the job failed before it."
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -s out/rows.json ] && [ "$(jq length out/rows.json)" -gt 0 ] && { echo; echo '<details><summary>stored rows</summary>'; echo; echo '```json'; cat out/rows.json; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"
+          [ -s out/function.log ] && { echo; echo "<details><summary>/aws/lambda/$NAME</summary>"; echo; echo '```'; cat out/function.log; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"
+          [ -f out/cleanup.md ] && { echo; cat out/cleanup.md; } >> "$GITHUB_STEP_SUMMARY"
+          true
+
+  notify-linear:
+    if: ${{ failure() && (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    needs: [docs, layer, lambda]
+    uses: ./.github/workflows/notify_linear_failure.yml
+    secrets: inherit

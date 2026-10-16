@@ -41,7 +41,8 @@ name: E2E
 
 on:
   push:
-    branches: [main]
+    # THROWAWAY: trial of handler.flush() at the end of the Python handler, never to be merged
+    branches: [main, claude/python-flush-trial]
   pull_request:
   schedule:
     - cron: '45 5 * * *'
@@ -215,7 +216,8 @@ jobs:
           with open('article/index.mjs', 'w') as file:
               file.write('export const handler = async () => {\n' + textwrap.indent(node_logging, '  ') + '\n};\n')
           with open('article/lambda_function.py', 'w') as file:
-              file.write(python_setup + '\n\n\ndef lambda_handler(event, context):\n' + textwrap.indent(python_logging, '    ') + '\n')
+              # THROWAWAY: the proposed docs change, the handler flushed at the end of the invocation
+              file.write(python_setup + '\n\n\ndef lambda_handler(event, context):\n' + textwrap.indent(python_logging + '\nhandler.flush()', '    ') + '\n')
           with open('article/article.json', 'w') as file:
               json.dump({
                   'layer': {'runtimes': options['--compatible-runtimes'], 'architectures': options['--compatible-architectures']},
@@ -228,6 +230,8 @@ jobs:
                      for runtime in options['--compatible-runtimes'] for arch in options['--compatible-architectures']]
           include += [{'language': 'python', 'runtime': runtime, 'arch': 'x86_64', 'variant': f"{runtime.replace('.', '')}-x86_64",
                        'python': runtime.removeprefix('python')} for runtime in os.environ['PYTHON_RUNTIMES'].split()]
+          # THROWAWAY: Python only
+          include = [entry for entry in include if entry['language'] == 'python']
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f"matrix={json.dumps({'include': include})}\n")
               output.write(f"install={install}\n")

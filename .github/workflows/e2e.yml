@@ -21,10 +21,11 @@ name: E2E
 # See the docs article in https://betterstack.com/docs/logs/aws-lambda/
 #
 # AWS account: better-stack-e2e-lambda (352333568934), shared with logtail/logtail-aws-lambda's E2E. Root sign-in:
-# 1Password, Engineering vault, item "AWS better-stack-e2e-lambda". This workflow assumes IAM role
-# `github-actions-e2e-lambda-docs`, which trusts this repository through the account's GitHub OIDC provider and may
-# only touch functions, layers and log groups named `e2e-lambda-docs-*`, so it cannot reach the other E2E's
-# resources. The functions run as the standing IAM role `e2e-lambda-exec`.
+# 1Password, Engineering vault, item "AWS better-stack-e2e-lambda". The account's CloudFormation stack `e2e-bootstrap`
+# holds the GitHub OIDC provider and IAM role `e2e-lambda-exec` the functions run as; the stack
+# `e2e-bootstrap-lambda-docs` adds IAM role `github-actions-e2e-lambda-docs`, which this workflow assumes. It trusts
+# this repository and may only touch functions, layers and log groups named `e2e-lambda-docs-*`, so it cannot reach
+# the other E2E's resources.
 # Secrets: TEST_TEAM_TELEMETRY_API, TEST_TEAM_CONNECTION_USERNAME, TEST_TEAM_CONNECTION_PASSWORD (the E2E testing team),
 # LINEAR_* (see notify_linear_failure.yml).
 

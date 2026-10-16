@@ -35,7 +35,7 @@ On next invocation your Lambda logs should start appearing in **Telemetry** -> [
 | RECEIVER_PORT                            | Port of the logs http receiver                          | `4243`                               |
 | MAX_ITEMS                                | Maximum number of events that can be buffered in memory | `10000`                              |
 | MAX_BYTES                                | Maximum size in bytes of events that can be buffered    | `262144`                             |
-| TIMEOUT_MS                               | Maximum time (in milliseconds) that a batch is buffered | `25`                                 |
+| TIMEOUT_MS                               | Maximum time (in milliseconds) that a batch is buffered | `1000`                               |
 | AWS_LAMBDA_RUNTIME_API                   | HTTP base URI to the lambda runtime API                 | _Provided by AWS Lambda environment_ |
 | AWS_LAMBDA_RUNTIME_EXTENSION_API_VERSION | Lambda Extension API version date                       | `2020-01-01`                         |
 | AWS_LAMBDA_RUNTIME_TELEMETRY_API_VERSION | Telemetry API version date                              | `2022-07-01`                         |

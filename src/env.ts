@@ -18,8 +18,7 @@ const baseSchema = z.object({
   RECEIVER_ADDRESS: z.string().default('sandbox'), // `sandbox` seems to be the default accepted address
   MAX_ITEMS: envNumber.default('10000'), // Maximum number of events that are buffered in memory.
   MAX_BYTES: envNumber.default('262144'), // Maximum size in bytes that the logs are buffered in memory.
-  // Maximum time (in milliseconds) that a batch is buffered; Lambda's minimum, as every invocation waits for its logs.
-  TIMEOUT_MS: envNumber.default('25'),
+  TIMEOUT_MS: envNumber.default('1000'), // Maximum time (in milliseconds) that a batch is buffered.
   RECEIVER_PORT: envNumber.default('4243'), // HTTP server receiving port
   // Better Stack source token; SOURCE_TOKEN is preferred, LOGTAIL_TOKEN is kept as a fallback.
   SOURCE_TOKEN: z.string().optional(),

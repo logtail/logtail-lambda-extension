@@ -23,7 +23,7 @@ describe('parseEnvironmentVariables', () => {
         RECEIVER_ADDRESS: 'sandbox',
         MAX_ITEMS: 10000,
         MAX_BYTES: 262144,
-        TIMEOUT_MS: 25,
+        TIMEOUT_MS: 1000,
         RECEIVER_PORT: 4243,
         sourceToken: 'source_token',
         ingestionUrl: 'https://s123456.lu-trq-1.betterstackdata.com/',

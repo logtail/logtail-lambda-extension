@@ -18,7 +18,10 @@ const baseSchema = z.object({
   RECEIVER_ADDRESS: z.string().default('sandbox'), // `sandbox` seems to be the default accepted address
   MAX_ITEMS: envNumber.default('10000'), // Maximum number of events that are buffered in memory.
   MAX_BYTES: envNumber.default('262144'), // Maximum size in bytes that the logs are buffered in memory.
-  TIMEOUT_MS: envNumber.default('1000'), // Maximum time (in milliseconds) that a batch is buffered.
+  // Maximum time (in milliseconds) Lambda buffers telemetry before it hands it to the extension; the extension waits for
+  // this hand-off at the end of every invocation, so Lambda's minimum keeps that wait short. Raise it to get fewer, larger
+  // hand-offs in long invocations that log more than 40 lines per second, at that much more time per invocation.
+  TIMEOUT_MS: envNumber.default('25'),
   RECEIVER_PORT: envNumber.default('4243'), // HTTP server receiving port
   // Better Stack source token; SOURCE_TOKEN is preferred, LOGTAIL_TOKEN is kept as a fallback.
   SOURCE_TOKEN: z.string().optional(),

@@ -45,7 +45,7 @@ describe('telemetrySubscription', () => {
       AWS_LAMBDA_RUNTIME_TELEMETRY_API_VERSION: '2022-07-01',
       RECEIVER_ADDRESS: 'sandbox',
       RECEIVER_PORT: 4243,
-      TIMEOUT_MS: 1000,
+      TIMEOUT_MS: 25,
       MAX_BYTES: 262144,
       MAX_ITEMS: 10000,
     });
@@ -54,7 +54,7 @@ describe('telemetrySubscription', () => {
       schemaVersion: '2022-07-01',
       destination: { protocol: 'HTTP', URI: 'http://sandbox:4243' },
       types: ['platform', 'function'],
-      buffering: { timeoutMs: 1000, maxBytes: 262144, maxItems: 10000 },
+      buffering: { timeoutMs: 25, maxBytes: 262144, maxItems: 10000 },
     });
   });
 });

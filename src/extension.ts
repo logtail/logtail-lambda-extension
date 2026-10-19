@@ -3,13 +3,9 @@ import { EnvironmentVars } from '~/env';
 import { pollForNextEvent, registerExtension } from '~/aws/api';
 import { startTelemetryHttpListener, TelemetryHttpListener } from '~/httpListener';
 import { subscribeTelemetry, SubscriptionBody } from '~/aws/subscribe';
-import { betterStackLogForwarder } from '~/forwarders/betterStack';
+import { betterStackLogForwarder, REQUEST_TIMEOUT_MS } from '~/forwarders/betterStack';
 import { AbortHandler } from '~/abortHandler';
 import { InvokeEvent } from '~/aws/events';
-
-// How long before an invocation's deadline the extension forwards the logs anyway when the runtime has not reported
-// that it finished, so the forwarding never makes the invocation time out.
-const DEADLINE_RESERVE_MS = 1000;
 
 export const telemetrySubscription = ({
   AWS_LAMBDA_RUNTIME_TELEMETRY_API_VERSION,
@@ -52,7 +48,9 @@ export const forwardInvocationLogs = (
 ): Promise<void> => {
   let timeout: NodeJS.Timeout | undefined;
   const beforeDeadline = new Promise<void>((resolve) => {
-    timeout = setTimeout(resolve, Math.max(0, event.deadlineMs - Date.now() - DEADLINE_RESERVE_MS));
+    // When the runtime has not reported that it finished, forward anyway early enough for the request to time out
+    // before the invocation's deadline, so the extension never makes the invocation time out.
+    timeout = setTimeout(resolve, Math.max(0, event.deadlineMs - Date.now() - REQUEST_TIMEOUT_MS));
   });
 
   return Promise.race([listener.runtimeDone(event.requestId), beforeDeadline])

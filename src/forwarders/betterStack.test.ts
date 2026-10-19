@@ -71,6 +71,25 @@ describe('test Better Stack log forwarding', () => {
     );
     expect(listener.logsQueue.length).toBe(3);
   });
+
+  test('forwarder should give up on a request Better Stack does not answer in time and re-queue the logs', async () => {
+    fetchMock.mockResponse(
+      (request: Request) =>
+        new Promise((_resolve, reject) => {
+          request.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted.')));
+        }),
+    );
+
+    const listener: { logsQueue: FunctionLogEvent[] } = {
+      logsQueue: [log, log],
+    };
+    const start = Date.now();
+
+    await betterStackLogForwarder(token, ingestionUrl, listener, 100)();
+
+    expect(Date.now() - start).toBeLessThan(1_000);
+    expect(listener.logsQueue.length).toBe(2);
+  });
 });
 
 describe('test parseMessageWithPowertoolsLogFormat`', () => {

@@ -35,8 +35,13 @@ export const parseMessageWithPowertoolsLogFormat = (message: string): E.Either<E
     }),
   );
 
+// How long a request to Better Stack may take before the extension gives up and keeps the logs queued for the next
+// forward, so an unresponsive endpoint holds an invocation for at most this long.
+export const REQUEST_TIMEOUT_MS = 1000;
+
 export const betterStackLogForwarder =
-  (token: string, ingestionUrl: string, listener: { logsQueue: FunctionLogEvent[] }) => (): Promise<void> => {
+  (token: string, ingestionUrl: string, listener: { logsQueue: FunctionLogEvent[] }, timeoutMs = REQUEST_TIMEOUT_MS) =>
+  (): Promise<void> => {
     const logs = listener.logsQueue.splice(0);
 
     if (logs.length === 0) {
@@ -71,6 +76,7 @@ export const betterStackLogForwarder =
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
+      signal: AbortSignal.timeout(timeoutMs),
     })
       .then(async (response) => {
         if (!response.ok) {

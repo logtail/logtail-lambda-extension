@@ -188,7 +188,7 @@ jobs:
               problems.append(f'the Python setup snippet has placeholders {sorted(set(re.findall(r"[$][A-Z_]+", python_setup)))}, expected {sorted(PLACEHOLDERS)}')
 
           # Python logging: logger.<level>('message'[, extra={fields}]) calls, either bare or inside the handler function
-          # the article shows, which may also flush the Better Stack handler (`<name>.flush()`).
+          # the article shows, which may also flush the Better Stack handler (`<name>.flush()`), also from a `finally`.
           python_lines, python_function = [], None
           try:
               statements = ast.parse(python_logging).body
@@ -198,6 +198,10 @@ jobs:
           if len(statements) == 1 and isinstance(statements[0], ast.FunctionDef):
               python_function = statements[0].name
               statements = statements[0].body
+          statements = [inner for statement in statements
+                         for inner in (statement.body + statement.finalbody
+                                       if isinstance(statement, ast.Try) and not statement.handlers and not statement.orelse
+                                       else [statement])]
           for statement in statements:
               call = statement.value if isinstance(statement, ast.Expr) else None
               if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == 'flush'

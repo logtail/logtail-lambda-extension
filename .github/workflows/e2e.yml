@@ -187,15 +187,22 @@ jobs:
           if set(re.findall(r'\$[A-Z_]+', python_setup)) != PLACEHOLDERS:
               problems.append(f'the Python setup snippet has placeholders {sorted(set(re.findall(r"[$][A-Z_]+", python_setup)))}, expected {sorted(PLACEHOLDERS)}')
 
-          # Python logging: logger.<level>('message'[, extra={fields}]) calls.
-          python_lines = []
+          # Python logging: logger.<level>('message'[, extra={fields}]) calls, either bare or inside the handler function
+          # the article shows, which may also flush the Better Stack handler (`<name>.flush()`).
+          python_lines, python_function = [], None
           try:
               statements = ast.parse(python_logging).body
           except SyntaxError as error:
               problems.append(f'the Python logging snippet does not parse: {error}')
               statements = []
+          if len(statements) == 1 and isinstance(statements[0], ast.FunctionDef):
+              python_function = statements[0].name
+              statements = statements[0].body
           for statement in statements:
               call = statement.value if isinstance(statement, ast.Expr) else None
+              if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == 'flush'
+                      and isinstance(call.func.value, ast.Name) and not call.args and not call.keywords):
+                  continue
               if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
                       and call.func.value.id == 'logger' and len(call.args) == 1 and isinstance(call.args[0], ast.Constant)
                       and all(keyword.arg == 'extra' for keyword in call.keywords)):
@@ -211,16 +218,20 @@ jobs:
               sys.exit(1)
 
           os.makedirs('article', exist_ok=True)
-          # The article shows the logging snippets without a handler around them; they become the handler's body.
+          # A logging snippet the article shows without a handler around it becomes the handler's body.
           with open('article/index.mjs', 'w') as file:
               file.write('export const handler = async () => {\n' + textwrap.indent(node_logging, '  ') + '\n};\n')
           with open('article/lambda_function.py', 'w') as file:
-              file.write(python_setup + '\n\n\ndef lambda_handler(event, context):\n' + textwrap.indent(python_logging, '    ') + '\n')
+              if python_function:
+                  file.write(python_setup + '\n\n\n' + python_logging + '\n')
+              else:
+                  file.write(python_setup + '\n\n\ndef lambda_handler(event, context):\n' + textwrap.indent(python_logging, '    ') + '\n')
           with open('article/article.json', 'w') as file:
               json.dump({
                   'layer': {'runtimes': options['--compatible-runtimes'], 'architectures': options['--compatible-architectures']},
                   'environment': environment,
                   'packages': packages,
+                  'python_handler': f"lambda_function.{python_function or 'lambda_handler'}",
                   'lines': {'node': node_lines, 'python': python_lines},
               }, file, indent=2)
 
@@ -453,7 +464,7 @@ jobs:
             ENVIRONMENT=$(jq -c --arg token "$SOURCE_TOKEN" --arg host "$INGESTING_HOST" '{Variables: (.environment | map_values(gsub("\\$SOURCE_TOKEN"; $token) | gsub("\\$INGESTING_HOST"; $host)))}' article/article.json)
             SETTINGS=(--handler index.handler --layers "$LAYER_ARN" --environment "$ENVIRONMENT")
           else
-            SETTINGS=(--handler lambda_function.lambda_handler)
+            SETTINGS=(--handler "$(jq -r '.python_handler' article/article.json)")
           fi
           # The response would echo the environment variables, token included; nothing of it is needed.
           aws lambda create-function --function-name "$NAME" --runtime "$RUNTIME" --architectures "$ARCH" --role "$LAMBDA_ROLE_ARN" \

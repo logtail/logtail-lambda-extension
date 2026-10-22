@@ -689,23 +689,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p report
           if [ ! -f out/readback-first.md ]; then
             FAILED_STEP=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
               --jq ".jobs[] | select(.runner_name == \"$RUNNER_NAME\") | .steps[] | select(.conclusion == \"failure\") | .name" | head -1) || true
           fi
+          INVOCATIONS=""
+          [ ! -f invocations.jsonl ] || INVOCATIONS=$(jq -rs 'to_entries[] | "- invocation \(.key + 1) at \(.value.invoked_at / 1000 | strftime("%H:%M:%S")), took \((.value.returned_at - .value.invoked_at) / 1000) s\(if .value.init_ms then ", a cold start with \(.value.init_ms) ms of init" else "" end)"' invocations.jsonl)
           {
             echo "### $RUNTIME $ARCH \`$NAME\`"
             echo
             [ -z "${SOURCE_ID:-}" ] || echo "- source $SOURCE_ID, ${PACKAGE_VERSIONS:-}"
-            [ ! -f invocations.jsonl ] || jq -rs 'to_entries[] | "- invocation \(.key + 1) at \(.value.invoked_at / 1000 | strftime("%H:%M:%S")), took \((.value.returned_at - .value.invoked_at) / 1000) s\(if .value.init_ms then ", a cold start with \(.value.init_ms) ms of init" else "" end)"' invocations.jsonl
+            [ -z "$INVOCATIONS" ] || echo "$INVOCATIONS"
             echo
             for readback in out/readback-first.md out/readback-final.md; do [ ! -f "$readback" ] || { cat "$readback"; echo; }; done
             [ -f out/readback-first.md ] || echo "❌ Stopped${FAILED_STEP:+ at **$FAILED_STEP**}, no read-back to show."
-          } > report/summary.md
-          cat report/summary.md >> "$GITHUB_STEP_SUMMARY"
-          # The Linear issue gets the cleanup only when it left something behind.
-          grep -q '❌' out/cleanup.md 2>/dev/null && { echo; cat out/cleanup.md; } >> report/summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The Linear issue names the job and links the run, so it gets the invocations and the verdict of the last
+          # read-back without its table, and the cleanup only when that left something behind. A job that stopped before
+          # its read-back gets its errors instead.
+          LAST_READBACK=$(ls out/readback-final.md out/readback-first.md 2>/dev/null | head -1)
+          if [ -n "$LAST_READBACK" ]; then
+            mkdir -p report
+            {
+              [ -z "$INVOCATIONS" ] || { echo "$INVOCATIONS"; echo; }
+              echo "$(head -1 "$LAST_READBACK" | sed 's/^#* *//'):"
+              echo
+              grep -E '^(- ❌|✅)' "$LAST_READBACK"
+            } > report/summary.md
+            grep -q '❌' out/cleanup.md 2>/dev/null && { echo; cat out/cleanup.md; } >> report/summary.md
+          fi
           [ -s out/rows.json ] && [ "$(jq length out/rows.json)" -gt 0 ] && { echo; echo '<details><summary>stored rows</summary>'; echo; echo '```json'; cat out/rows.json; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"
           [ -s out/function.log ] && { echo; echo "<details><summary>/aws/lambda/$NAME</summary>"; echo; echo '```'; cat out/function.log; echo '```'; echo '</details>'; } >> "$GITHUB_STEP_SUMMARY"
           [ -f out/cleanup.md ] && { echo; cat out/cleanup.md; } >> "$GITHUB_STEP_SUMMARY"
@@ -717,6 +729,7 @@ jobs:
         with:
           name: e2e-summary-${{ matrix.runtime }} ${{ matrix.arch }}
           path: report/summary.md
+          if-no-files-found: ignore
           retention-days: 7
           overwrite: true
 

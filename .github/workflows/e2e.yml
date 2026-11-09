@@ -515,10 +515,11 @@ jobs:
           credentials = base64.b64encode(f"{env['TEST_TEAM_CONNECTION_USERNAME']}:{env['TEST_TEAM_CONNECTION_PASSWORD']}".encode()).decode()
 
           def sql(query):
-              request = urllib.request.Request(f"https://{env['CONNECT_HOST']}/", data=f'{query} FORMAT JSONEachRow'.encode(),
+              # wait=true queues the query for up to 60 s while the connection user's 4 concurrent logs queries are busy, instead of HTTP 429.
+              request = urllib.request.Request(f"https://{env['CONNECT_HOST']}/?wait=true", data=f'{query} FORMAT JSONEachRow'.encode(),
                                                headers={'Authorization': f'Basic {credentials}', 'Content-Type': 'plain/text'})
               try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
+                  with urllib.request.urlopen(request, timeout=90) as response:
                       return [json.loads(line) for line in response.read().decode().splitlines() if line]
               except urllib.error.HTTPError as error:
                   body = error.read().decode()
